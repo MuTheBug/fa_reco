@@ -7,9 +7,12 @@ networks; the GUI thread exchanges data with it through Qt signals.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import traceback
+
+import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 
@@ -40,6 +43,7 @@ class FaceWorker(QThread):
         self.session: RecognitionSession | None = None
         self.enrollment: EnrollmentSession | None = None
         self.load_error = ""
+        self.probe_flip = False
 
     # ------------------------------------------------------------ GUI side
     def set_mode(self, mode: str) -> None:
@@ -97,6 +101,7 @@ class FaceWorker(QThread):
             self.engine = FaceEngine(self.settings.get("recog.engine", "dual"))
             ensure_embeddings(self.db, self.engine, lambda i, n: self.progress.emit(i, n))
             self.engine.set_galleries(load_galleries(self.db, self.engine))
+            self.probe_flip = self._fast_enough_for_flip()
         except Exception as exc:  # models missing / corrupted
             self.load_error = f"{exc}"
             traceback.print_exc()
@@ -135,6 +140,18 @@ class FaceWorker(QThread):
                 traceback.print_exc()
                 time.sleep(0.2)
 
+    def _fast_enough_for_flip(self) -> bool:
+        """Averaging each probe with its mirror image adds accuracy but doubles the cost;
+        enable it only when the computer keeps recognition well under a second."""
+        chip = np.random.default_rng(0).integers(0, 255, (112, 112, 3), dtype=np.uint8)
+        self.engine.primary.embed(chip, flip=False)  # warm-up
+        t0 = time.perf_counter()
+        for _ in range(2):
+            self.engine.primary.embed(chip, flip=False)
+        per_frame = (time.perf_counter() - t0) / 2
+        logging.getLogger("hadir").info("primary embedder %.0f ms per frame", per_frame * 1000)
+        return per_frame < 0.11
+
     def _switch(self, mode: str) -> None:
         s = self.settings
         mirror = bool(s.get("camera.mirror", True))
@@ -142,7 +159,7 @@ class FaceWorker(QThread):
             self.session = RecognitionSession(
                 self.engine, security=s.get("recog.security", "high"),
                 liveness=s.get("recog.liveness", "auto"), mirror=mirror,
-                min_eye_px=float(s.get("recog.min_eye_px", 40)))
+                min_eye_px=float(s.get("recog.min_eye_px", 40)), probe_flip=self.probe_flip)
         elif mode == "enroll" and self.enrollment is None:
             self.enrollment = EnrollmentSession(self.engine, mirror=mirror,
                                                 min_eye_px=float(s.get("recog.min_eye_px", 40)))

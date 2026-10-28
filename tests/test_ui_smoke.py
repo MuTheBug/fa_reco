@@ -144,3 +144,16 @@ def test_time_fields_are_not_mirrored(qapp):
 
     assert TimeEdit(time(8, 0)).text() == "08:00"
     assert DateEdit(date(2026, 10, 31)).text() == "2026/10/31"
+
+
+def test_tables_keep_given_order_until_header_click(qapp):
+    from PySide6.QtCore import Qt
+
+    from hadir.ui.widgets.common import DataTable
+
+    t = DataTable([("name", "الاسم", "text"), ("score", "الدرجة", "float")])
+    t.set_rows([{"name": "ب", "score": 0.9}, {"name": "أ", "score": 0.1}])
+    first = t.model().index(0, 0).data()
+    assert first == "ب"
+    t.sortByColumn(1, Qt.AscendingOrder)
+    assert t.model().index(0, 0).data() == "أ"

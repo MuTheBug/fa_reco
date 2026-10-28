@@ -169,10 +169,14 @@ class Database:
     # ------------------------------------------------------ engine loading
     def load_org(self) -> E.OrgData:
         s = self.settings
+        try:
+            day_start = parse_time(s.get("attendance.day_start")) or time(4, 0)
+        except (TypeError, ValueError):
+            day_start = time(4, 0)
         org = E.OrgData(
             schedules=self.schedules.all_engine(),
             holidays=self.holidays.all_engine(),
-            day_start=parse_time(s.get("attendance.day_start")) or time(4, 0),
+            day_start=day_start,
             dedupe_seconds=int(s.get("attendance.dedupe_seconds")),
             low_liveness=float(s.get("attendance.low_liveness") or 0),
         )

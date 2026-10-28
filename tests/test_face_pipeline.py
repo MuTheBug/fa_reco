@@ -239,3 +239,28 @@ def test_enrollment_refuses_a_photo_by_default(engine):
         st = sess.feed(attack)
         clock.tick(0.5)
     assert not sess.captures and st.message == "يبدو أنها صورة وليست وجهاً حقيقياً"
+
+
+def test_challenge_requires_same_identity(engine, enrolled):
+    """Recognised as A with a weak liveness score, then another face turns its head:
+    the challenge must not pass for A."""
+    from hadir.face.pipeline import RecognitionSession
+
+    from .facedata import PEOPLE, load, webcam_frames
+
+    db, ids = enrolled
+    clock = Clock()
+    sess = RecognitionSession(engine, liveness="always", clock=clock)
+    decision = None
+    for f in webcam_frames(load(PEOPLE["A"][3]), 6, detector=engine.detector):
+        st, decision = sess.process(f)
+        clock.tick()
+        if sess.state == "challenge" or decision:
+            break
+    assert sess.state == "challenge" and decision is None
+    for f in webcam_frames(load(PEOPLE["G"][0]), 6, detector=engine.detector, seed=3):
+        st, decision = sess.process(f)
+        clock.tick()
+        if decision:
+            break
+    assert decision is not None and decision.kind != "accept"

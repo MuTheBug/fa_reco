@@ -187,6 +187,8 @@ class DataTable(QTableView):
         self.proxy = SortProxy(self)
         self.proxy.setSourceModel(self.model_)
         self.setModel(self.proxy)
+        # Keep the order the rows were given in until the user clicks a column header.
+        self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         self.setSortingEnabled(True)
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)

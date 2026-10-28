@@ -236,7 +236,8 @@ class RecognitionSession:
         if not a.quality.ok:
             st.tone, st.message = "warn", a.quality.reason
             if self.state == "challenge" and self.challenge:
-                self.challenge.update(a.quality.yaw if a.quality.eye_px > 0 else None, now)
+                # Unusable frames never count towards the head turn (only the timeout runs).
+                self.challenge.update(None, now)
                 return self._challenge_status(st, a, now)
             return st, None
         if self.engine.primary.id not in a.scores:
@@ -331,8 +332,10 @@ class RecognitionSession:
     def _challenge_step(self, st: Status, a: Analysis, frame, now: float):
         claim = self.claim
         score = a.scores[self.engine.primary.id].get(claim.employee_id, 0.0)
-        # Identity must stay the same during the movement (allowing for the head turn).
-        if abs(a.quality.yaw) < 0.25 and score < self.thresholds[0] - 0.15:
+        # The same person must stay in front of the camera throughout the movement (stops
+        # a photo being swapped for another face); a turned head is allowed a lower score.
+        limit = self.thresholds[0] - (0.15 if abs(a.quality.yaw) < 0.25 else 0.25)
+        if score < limit:
             return self._finish(st, now, Decision("unknown", None, score, best=claim.best))
         self.challenge.update(a.quality.yaw, now)
         return self._challenge_status(st, a, now)

@@ -46,7 +46,7 @@ Source: "..\dist\Hadir\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubd
 [Icons]
 Name: "{group}\حاضر — شاشة الحضور"; Filename: "{app}\Hadir.exe"
 Name: "{group}\حاضر — الإدارة"; Filename: "{app}\Hadir.exe"; Parameters: "--admin"
-Name: "{group}\حاضر — نسخة تجريبية ببيانات وهمية"; Filename: "{app}\Hadir.exe"; Parameters: "--demo --data-dir ""{userappdata}\Hadir-Demo"""
+Name: "{group}\حاضر — نسخة تجريبية ببيانات وهمية"; Filename: "{app}\Hadir.exe"; Parameters: "--demo"
 Name: "{group}\إزالة حاضر"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\حاضر"; Filename: "{app}\Hadir.exe"; Tasks: desktopicon
 Name: "{commonstartup}\حاضر"; Filename: "{app}\Hadir.exe"; Tasks: autostart

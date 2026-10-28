@@ -193,3 +193,8 @@ def test_backup(db, tmp_path):
     db.backup_to(target)
     other = Database(target)
     assert other.scalar("SELECT COUNT(*) FROM employees") == 1
+
+
+def test_invalid_day_start_falls_back(db):
+    db.settings.set("attendance.day_start", "99:99")
+    assert db.load_org().day_start.hour == 4

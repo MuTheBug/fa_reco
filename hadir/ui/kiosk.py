@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel
                                QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget)
 
 from ..core.settings import SECURITY_LEVELS
+from ..face.pipeline import Status
 from ..core.timeutil import digits, fmt_date_long, fmt_time, parse_dt
 from ..kiosk_logic import KioskResult
 from .sound import play
@@ -242,9 +243,10 @@ class KioskScreen(QWidget):
         self.result.hide()
 
     def set_loading(self, text: str):
+        """Show why recognition is not running yet (loading models, or an error)."""
         self._loading = text
         self.camera.placeholder = text or "جارٍ تشغيل الكاميرا…"
-        self.camera.update()
+        self.camera.set_status(Status(state="idle", message=text, tone="warn") if text else None)
 
     # --------------------------------------------------------------- timers
     def _tick(self):

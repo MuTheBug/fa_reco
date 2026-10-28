@@ -350,6 +350,11 @@ class SettingsPage(Page):
         if not values["org.name"]:
             error(self, "اسم الدائرة مطلوب.")
             return
+        hh, _, mm = values["attendance.day_start"].partition(":")
+        if not (hh.isdigit() and mm.isdigit() and int(hh) < 24 and int(mm) < 60):
+            error(self, "وقت «بداية اليوم» غير صحيح؛ اكتبه بصيغة ساعة:دقيقة مثل 04:00.")
+            return
+        values["attendance.day_start"] = f"{int(hh):02d}:{int(mm):02d}"
         old = self.db.settings.all()
         self.db.settings.set_many(values)
         self.ctx.reload_settings()

@@ -195,6 +195,10 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.data_dir:
         os.environ["HADIR_DATA_DIR"] = args.data_dir
+    elif args.demo:
+        # demonstration data never mixes with the real database
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".local" / "share")
+        os.environ["HADIR_DATA_DIR"] = str(Path(base) / "Hadir-Demo")
     if args.selftest:
         return selftest(args)
     _setup_logging()
