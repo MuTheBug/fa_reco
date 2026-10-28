@@ -37,7 +37,8 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
         db.groups.assign_schedule(g_eve, evening, "2000-01-01")
         g_duty = db.groups.save("المناوبون", "حراسة وخدمات بنظام ٢٤/٤٨")
         db.groups.assign_schedule(g_duty, duty, "2000-01-01")
-        plan = [base_group] * (employees - 6) + [g_eve] * 3 + [g_duty] * 3
+        n_side = min(3, employees // 4)
+        plan = [base_group] * (employees - 2 * n_side) + [g_eve] * n_side + [g_duty] * n_side
         ids = []
         start = today - timedelta(days=days)
         for i in range(employees):
@@ -48,17 +49,20 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
                 hire_date=(start - timedelta(days=400)).isoformat(), group_id=plan[i]),
                 group_effective="2000-01-01")
             ids.append(eid)
+        def pick(i):
+            return ids[i % len(ids)]
+
         holiday = start + timedelta(days=9)
         db.holidays.save("عطلة رسمية", holiday, holiday)
         types = {t["name"]: t["id"] for t in db.leaves.types()}
-        db.leaves.add(ids[2], types["إجازة اعتيادية"], start + timedelta(days=3), start + timedelta(days=6),
+        db.leaves.add(pick(2), types["إجازة اعتيادية"], start + timedelta(days=3), start + timedelta(days=6),
                       reference="أمر إداري ٤٥")
-        db.leaves.add(ids[5], types["إجازة مرضية"], start + timedelta(days=15), start + timedelta(days=16))
-        db.leaves.add(ids[7], types["واجب رسمي / إيفاد"], start + timedelta(days=20), start + timedelta(days=22))
+        db.leaves.add(pick(5), types["إجازة مرضية"], start + timedelta(days=15), start + timedelta(days=16))
+        db.leaves.add(pick(7), types["واجب رسمي / إيفاد"], start + timedelta(days=20), start + timedelta(days=22))
         hourly_day = start + timedelta(days=12)
         while hourly_day.weekday() in (4, 5):
             hourly_day += timedelta(days=1)
-        db.leaves.add(ids[1], types["إجازة زمنية"], hourly_day, None, "08:00", "10:00")
+        db.leaves.add(pick(1), types["إجازة زمنية"], hourly_day, None, "08:00", "10:00")
 
     org = db.load_org()
     emps = {e.id: e for e in db.load_employees(ids, start, today)}
@@ -80,7 +84,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
                 arrive = shift.start + timedelta(minutes=habit + rnd.gauss(0, 6))
                 if rnd.random() < 0.08:
                     arrive += timedelta(minutes=rnd.randint(15, 70))
-                if d == hourly_day and eid == ids[1]:
+                if d == hourly_day and eid == pick(1):
                     arrive = shift.start + timedelta(minutes=118)
                 leave = shift.end + timedelta(minutes=rnd.gauss(4, 5))
                 if rnd.random() < 0.05:
@@ -96,7 +100,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
                 db.punches.add_face(eid, leave.replace(microsecond=0), score=round(rnd.uniform(0.62, 0.9), 3),
                                     liveness=round(rnd.uniform(0.85, 1.0), 3))
         # a few corrections with written reasons
-        sample = db.punches.list(ids[0], start, today)
+        sample = db.punches.list(pick(0), start, today)
         if sample:
             p = sample[0]
             ts = datetime.fromisoformat(p["ts"])
@@ -105,7 +109,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
         miss_day = today - timedelta(days=4)
         while miss_day.weekday() in (4, 5):
             miss_day -= timedelta(days=1)
-        db.punches.add_manual(ids[3], datetime.combine(miss_day, datetime.min.time()).replace(hour=14, minute=5),
+        db.punches.add_manual(pick(3), datetime.combine(miss_day, datetime.min.time()).replace(hour=14, minute=5),
                               "out", "نسي تسجيل الانصراف — بموافقة المدير المباشر")
 
 

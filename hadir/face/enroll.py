@@ -52,6 +52,7 @@ class EnrollmentSession:
     mirror: bool = True
     min_eye_px: float = 40
     clock: object = time.monotonic
+    check_liveness: bool = True  # refuse printed photos / screens in front of the camera
     step: int = 0
     captures: list = field(default_factory=list)
     _last_capture: float = 0.0
@@ -129,7 +130,7 @@ class EnrollmentSession:
                 return st
             if max(float(emb[pid] @ c.emb[pid]) for c in self.captures) > NEAR_DUPLICATE:
                 return st
-        if pose == "front" and self.engine.liveness.available:
+        if pose == "front" and self.check_liveness and self.engine.liveness.available:
             live = self.engine.liveness.score(frame, a.face)
             if live < 0.2:
                 st.message, st.tone = "يبدو أنها صورة وليست وجهاً حقيقياً", "bad"

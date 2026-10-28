@@ -163,3 +163,79 @@ def test_head_turn_challenge_logic():
     for i, yaw in enumerate([0, 0, 0.2, 0.25, 0.3]):
         res = ch.update(yaw, i * 0.2)
     assert res == "pending"
+
+
+def test_guided_enrollment_flow(engine, tmp_path):
+    """Front captures come from several photos; turn/tilt steps are skipped (a still photo
+    cannot turn), then the samples are saved and the person is recognised."""
+    from hadir.db.store import Database
+    from hadir.face.enroll import STEPS, EnrollmentSession
+    from hadir.face.service import load_galleries, save_captures
+
+    from .facedata import PEOPLE, load, webcam_frames
+
+    clock = Clock()
+    # simulated frames are photos, which the live-face check would (rightly) refuse
+    sess = EnrollmentSession(engine, clock=clock, check_liveness=False)
+    photos = [load(f) for f in PEOPLE["A"][:7]]
+    frames = []
+    for i, img in enumerate(photos):
+        frames += webcam_frames(img, 2, eye_px=95, detector=engine.detector, seed=i)
+    captured = 0
+    for f in frames:
+        if sess.done:
+            break
+        while not sess.done and STEPS[sess.step][0] != "front":
+            sess.skip_step()
+        st = sess.feed(f)
+        clock.tick(0.5)
+        captured = st.captured
+    while not sess.done and STEPS[sess.step][0] != "front":
+        sess.skip_step()
+    assert captured >= 5
+    samples = sess.final_samples()
+    assert len(samples) >= 5 and all(c.pose == "front" for c in samples)
+    db = Database(tmp_path / "e.db")
+    eid = db.employees.save(dict(code="9", full_name="مسجل بالكاميرا"))
+    save_captures(db, eid, samples)
+    assert db.employees.photo(eid)
+    saved = engine.galleries
+    try:
+        engine.set_galleries(load_galleries(db, engine))
+        d, _ = run(engine, webcam_frames(load(PEOPLE["A"][7]), 8, detector=engine.detector, seed=99))
+        assert d.kind == "accept" and d.employee_id == eid
+    finally:
+        engine.set_galleries(saved)
+
+
+def test_enrollment_rejects_a_different_person(engine):
+    from hadir.face.enroll import EnrollmentSession
+
+    from .facedata import PEOPLE, load, webcam_frames
+
+    clock = Clock()
+    sess = EnrollmentSession(engine, clock=clock, check_liveness=False)
+    for f in webcam_frames(load(PEOPLE["A"][0]), 2, eye_px=95, detector=engine.detector):
+        sess.feed(f)
+        clock.tick(0.5)
+    n = len(sess.captures)
+    st = None
+    for f in webcam_frames(load(PEOPLE["B"][2]), 3, eye_px=95, detector=engine.detector):
+        st = sess.feed(f)
+        clock.tick(0.5)
+    assert len(sess.captures) == n and st.tone == "bad"
+
+
+def test_enrollment_refuses_a_photo_by_default(engine):
+    from hadir.face.enroll import EnrollmentSession
+
+    from .facedata import SILENT, load
+
+    clock = Clock()
+    sess = EnrollmentSession(engine, clock=clock)
+    attack = load("image_F2.jpg", SILENT)
+    st = None
+    for _ in range(3):
+        st = sess.feed(attack)
+        clock.tick(0.5)
+    assert not sess.captures and st.message == "يبدو أنها صورة وليست وجهاً حقيقياً"
