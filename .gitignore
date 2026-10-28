@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/build/
+/dist/
+/.venv/
+/venv/
+*.db
+*.db-wal
+*.db-shm
+/data/
+# Large models are downloaded by tools/fetch_models.py (SHA-256 pinned)
+/models/arcfaceresnet100-8.onnx
+/models/arcfaceresnet100-11-int8.onnx
+/models/face_recognition_sface_2021dec.onnx
