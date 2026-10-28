@@ -6,6 +6,8 @@ from datetime import date, datetime, time, timedelta
 
 # date.weekday(): Monday == 0 ... Sunday == 6
 WEEKDAYS_AR = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
+# One-letter forms used in narrow table headers (أحد=ح، اثنين=ن، ثلاثاء=ث ...).
+WEEKDAYS_SHORT = ("ن", "ث", "ر", "خ", "ج", "س", "ح")
 # Display order for week editors: the Arab working week starts on Sunday.
 WEEK_ORDER = (6, 0, 1, 2, 3, 4, 5)
 

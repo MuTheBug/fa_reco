@@ -45,6 +45,8 @@ DEFAULTS: dict = {
     "backup.dir": "",
     "backup.keep": 30,
     "backup.include_snapshots": False,
+    # Reports
+    "reports.signatures": ["منظّم الكشف", "مسؤول الموارد البشرية", "المدير"],
     # Integrity
     "security.clock_check": True,
 }
