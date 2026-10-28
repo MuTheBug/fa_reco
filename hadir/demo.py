@@ -24,7 +24,6 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
     rnd = random.Random(seed)
     seed_defaults(db)
     with db.tx():
-        base_sched = db.scalar("SELECT id FROM schedules ORDER BY id")
         base_group = db.scalar("SELECT id FROM emp_groups ORDER BY id")
         db.groups.save("الموظفون", "الدوام الصباحي الاعتيادي", base_group)
         evening = db.schedules.save(dict(

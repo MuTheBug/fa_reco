@@ -200,7 +200,7 @@ def select_employees(db: Database, start: date, end: date, group_ids=None, emplo
         if department and department.strip() not in (r["department"] or ""):
             continue
         if not include_inactive and not r["active"]:
-            hire, gone = parse_date(r["hire_date"]), parse_date(r["end_date"])
+            gone = parse_date(r["end_date"])
             # still include people who left during the period (their days count)
             if not (gone and gone >= start):
                 continue

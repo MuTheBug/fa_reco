@@ -112,7 +112,7 @@ def load_legacy_state_dict(path: str) -> dict[str, np.ndarray]:
         protocol = pickle.load(f)
         if protocol != 1001:
             raise ValueError(f"unsupported protocol {protocol}")
-        _sys_info = pickle.load(f)
+        pickle.load(f)  # system info
         storages: dict[str, tuple] = {}
         result = _Unpickler(f, storages).load()
         keys = pickle.load(f)
