@@ -41,8 +41,7 @@ def test_builtin_reports_render(report_id, db, qapp, tmp_path):
     pages = export_pdf(rep, str(pdf))
     assert pages >= 1 and pdf.read_bytes()[:4] == b"%PDF"
     images = render_images(rep, dpi=90)
-    # wrapping differs slightly between 300 dpi (PDF) and 90 dpi (preview) font sizes
-    assert abs(len(images) - pages) <= max(2, pages // 5)
+    assert len(images) == pages
     if SHOTS:
         for i, img in enumerate(images[:2]):
             img.save(os.path.join(SHOTS, f"report_{report_id}_{i + 1}.png"))

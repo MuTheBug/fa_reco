@@ -393,22 +393,27 @@ def export_pdf(report: Report, path: str, logo: QImage | None = None) -> int:
     return paint_on(writer, report, logo)
 
 
-def render_images(report: Report, dpi: int = 110, logo: QImage | None = None) -> list[QImage]:
-    """Rasterise pages (used by tests and thumbnails)."""
+def render_images(report: Report, dpi: int = 110, logo: QImage | None = None,
+                  layout_dpi: int = 300) -> list[QImage]:
+    """Rasterise pages (tests and thumbnails).  Laid out at print resolution and scaled,
+    so the pagination is identical to the printed/PDF output."""
     size = QPageSize(QPageSize.A4).sizePoints()
     w_in, h_in = size.width() / 72, size.height() / 72
     if report.landscape:
         w_in, h_in = h_in, w_in
     margin = 10 * MM
-    area = QRectF(0, 0, (w_in - 2 * margin) * dpi, (h_in - 2 * margin) * dpi)
+    area = QRectF(0, 0, (w_in - 2 * margin) * layout_dpi, (h_in - 2 * margin) * layout_dpi)
     renderer = ReportRenderer(report, logo)
-    count = renderer.layout(area, dpi)
+    count = renderer.layout(area, layout_dpi)
     images = []
     for i in range(count):
         img = QImage(int(w_in * dpi), int(h_in * dpi), QImage.Format_RGB32)
         img.fill(QColor("white"))
         painter = QPainter(img)
-        painter.translate(margin * dpi, margin * dpi)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        painter.scale(dpi / layout_dpi, dpi / layout_dpi)
+        painter.translate(margin * layout_dpi, margin * layout_dpi)
         renderer.paint(painter, i)
         painter.end()
         images.append(img)
