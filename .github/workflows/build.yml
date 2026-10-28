@@ -55,7 +55,9 @@ jobs:
         shell: pwsh
         run: |
           $v = python -c "import hadir; print(hadir.__version__)"
-          if ($env:GITHUB_REF -like 'refs/tags/v*') { $v = $env:GITHUB_REF_NAME.Substring(1) }
+          if ($env:GITHUB_REF -like 'refs/tags/v*' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "tag $env:GITHUB_REF_NAME does not match hadir.__version__ $v"
+          }
           "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Build with PyInstaller
         run: pyinstaller packaging/hadir.spec --noconfirm
@@ -96,10 +98,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: out
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: out/*
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          test -f "out/HadirSetup-$version.exe"
+          test -f "out/Hadir-Portable-$version.zip"
+          (cd out && sha256sum -- * > SHA256SUMS.txt)
+          ls -l out
+          sed "s/@VERSION@/$version/g" packaging/release-notes.md > notes.md
+          { echo; echo '```'; cat out/SHA256SUMS.txt; echo '```'; } >> notes.md
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" out/* --clobber
+            gh release edit "$tag" --title "حاضر $version" --notes-file notes.md
+          else
+            gh release create "$tag" out/* --title "حاضر $version" --notes-file notes.md --verify-tag
+          fi
