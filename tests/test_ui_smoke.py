@@ -3,49 +3,6 @@
 from datetime import date
 
 import pytest
-from PySide6.QtCore import QObject, Signal
-
-
-class StubWorker(QObject):
-    ready = Signal(str)
-    progress = Signal(int, int)
-    status = Signal(object)
-    decision = Signal(object, object)
-    enroll_status = Signal(object)
-    analysis = Signal(object, object)
-
-    engine = None
-    ready_ok = False
-    load_error = ""
-    mode = "idle"
-
-    def set_mode(self, mode):
-        self.mode = mode
-
-    def configure(self, settings):
-        pass
-
-    def reload_galleries(self):
-        pass
-
-    def pause(self, timeout=0):
-        return self.mode
-
-    def stop(self):
-        pass
-
-
-class StubCamera:
-    state, error, fps, brightness = "error", "لا توجد كاميرا", 0.0, 0.0
-
-    def latest(self):
-        return None, 0
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
 
 
 @pytest.fixture
@@ -53,9 +10,10 @@ def window(qapp, tmp_path, monkeypatch):
     monkeypatch.setenv("HADIR_DATA_DIR", str(tmp_path))
     from hadir.demo import demo_database
     from hadir.ui.main_window import AppContext, MainWindow
+    from hadir.ui.selfcheck import IdleFaceWorker, NoCamera
 
     db = demo_database(tmp_path / "ui.db", date(2026, 10, 28), employees=8, days=20)
-    ctx = AppContext(db, StubCamera(), StubWorker())
+    ctx = AppContext(db, NoCamera(), IdleFaceWorker())
     win = MainWindow(ctx, kiosk_first=False)
     win.resize(1366, 768)
     yield win
@@ -79,6 +37,18 @@ def test_every_page_builds_and_refreshes(window, qapp):
     tl._select_day()
     dash = window.admin.pages["dashboard"]
     assert dash.table.model_.rowCount() == 8
+
+
+def test_selfcheck_opens_every_page(qapp, tmp_path, monkeypatch):
+    """The packaged program's --selftest opens the admin pages this way."""
+    monkeypatch.setenv("HADIR_DATA_DIR", str(tmp_path))
+    from hadir.demo import demo_database
+    from hadir.ui.admin import PAGES
+    from hadir.ui.selfcheck import open_every_page
+
+    db = demo_database(tmp_path / "s.db", date(2026, 10, 28), employees=3, days=5)
+    assert open_every_page(db) == len(PAGES)
+    db.close()
 
 
 def test_dialogs_build(window, qapp):

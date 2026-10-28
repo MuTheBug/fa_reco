@@ -3,10 +3,26 @@
 from pathlib import Path
 
 import PySide6
-from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).parent
 QT_TRANSLATIONS = Path(PySide6.__file__).parent / "Qt" / "translations"
+
+
+def source_modules(package):
+    """Every module of the package, listed from its source files.
+
+    The admin pages are imported by name, so the build must be told about them.
+    collect_submodules() cannot do it: it imports the package, and the project
+    folder is not on sys.path while this file runs, so it silently found nothing.
+    """
+    names = []
+    for path in sorted((ROOT / package).rglob("*.py")):
+        parts = path.relative_to(ROOT).with_suffix("").parts
+        if parts[-1] == "__main__":
+            continue
+        names.append(".".join(parts[:-1] if parts[-1] == "__init__" else parts))
+    return names
+
 
 datas = [
     (str(ROOT / "hadir" / "resources"), "hadir/resources"),
@@ -25,7 +41,7 @@ a = Analysis(
     [str(ROOT / "packaging" / "launcher.py")],
     pathex=[str(ROOT)],
     datas=datas,
-    hiddenimports=collect_submodules("hadir"),
+    hiddenimports=source_modules("hadir"),
     excludes=["tkinter", "pytest", "onnx", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtWebEngineCore"],
     noarchive=False,
 )

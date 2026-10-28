@@ -1,7 +1,7 @@
 ﻿; Inno Setup script — builds HadirSetup-<version>.exe
-; iscc packaging\installer.iss /DAppVersion=1.0.0
+; iscc packaging\installer.iss /DAppVersion=1.0.1
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.1"
 #endif
 
 [Setup]

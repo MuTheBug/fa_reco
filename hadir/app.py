@@ -170,17 +170,26 @@ def selftest(args) -> int:
     from .reports import builtin
     from .reports.excel import export_xlsx
     from .reports.render import export_pdf
+    from .ui.selfcheck import open_every_page
 
+    code = 0
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ["HADIR_DATA_DIR"] = str(Path(tmp) / "data")
         db = demo_database(Path(tmp) / "t.db", date(2026, 10, 28), employees=10, days=20)
         for rid, *_ in builtin.CATALOG:
             rep = builtin.build(db, rid, builtin.default_params(rid, date(2026, 10, 28)))
             export_xlsx(rep, str(Path(tmp) / f"{rid}.xlsx"))
             pages = export_pdf(rep, str(Path(tmp) / f"{rid}.pdf"))
             out.append(f"report {rid}: {pages} page(s)")
+        # the admin pages are imported by name when first opened: open each one in this build
+        try:
+            out.append(f"admin pages: {open_every_page(db)} opened")
+        except Exception:
+            out.append(traceback.format_exc())
+            code = 4
         db.close()
     del app
-    return finish(0)
+    return finish(code)
 
 
 def main(argv=None) -> int:

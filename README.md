@@ -176,7 +176,7 @@ python -m pytest -q                   # الاختبارات
 - `hadir/ui/` — الواجهة العربية (شاشة الحضور والإدارة).
 - `packaging/` و`.github/workflows/build.yml` — بناء برنامج ويندوز وملف التثبيت تلقائياً مع اختبار ذاتي للنسخة المبنية.
 
-**نشر إصدار جديد**: ارفع الرقم `__version__` في `hadir/__init__.py`، ثم من صفحة **Actions ← build ← Run workflow** فعّل خيار `release`.
+**نشر إصدار جديد**: ارفع الرقم `__version__` في `hadir/__init__.py` واكتب قسم «الجديد في هذا الإصدار» في `packaging/release-notes.md`، ثم من صفحة **Actions ← build ← Run workflow** فعّل خيار `release`.
 يُبنى ملف التثبيت ويُختبر ثم يُنشر في صفحة الإصدارات بالوسم `vX.Y.Z` مع بصمات SHA-256 (ويمكن بدلاً من ذلك دفع وسم `vX.Y.Z` مطابق للرقم).
 
 ---
