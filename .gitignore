@@ -13,3 +13,4 @@ __pycache__/
 /models/arcfaceresnet100-8.onnx
 /models/arcfaceresnet100-11-int8.onnx
 /models/face_recognition_sface_2021dec.onnx
+/tests/.cache/
