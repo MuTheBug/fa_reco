@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==9.2.0
+pyflakes==4.0.3
+onnx==1.23.2

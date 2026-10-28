@@ -39,9 +39,11 @@ def _excepthook(exc_type, exc, tb):
 
 def _qt_app(argv):
     from PySide6.QtCore import QLibraryInfo, QLocale, Qt, QTranslator
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     from .fonts import register_fonts
+    from .paths import resource_dir
     from .ui.theme import apply_theme
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -53,9 +55,13 @@ def _qt_app(argv):
     app._translators = []
     for name in ("qtbase_ar", "qt_ar"):
         tr = QTranslator(app)
-        if tr.load(name, QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+        if (tr.load(name, QLibraryInfo.path(QLibraryInfo.TranslationsPath))
+                or tr.load(name, str(resource_dir() / "i18n"))):
             app.installTranslator(tr)
             app._translators.append(tr)
+    icon_file = resource_dir() / "icons" / "hadir.png"
+    if icon_file.exists():
+        app.setWindowIcon(QIcon(str(icon_file)))
     register_fonts()
     apply_theme(app)
     return app
@@ -125,8 +131,17 @@ def selftest(args) -> int:
     import cv2
     import numpy as np
 
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    if sys.platform != "win32":
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     out = []
+
+    def finish(code: int) -> int:
+        text = "\n".join(out) + ("\nSELFTEST OK" if code == 0 else f"\nSELFTEST FAILED ({code})")
+        print(text)
+        if args.selftest_out:
+            Path(args.selftest_out).write_text(text, encoding="utf-8")
+        return code
+
     from .face import models
 
     for spec in models.ALL_MODELS:
@@ -134,8 +149,7 @@ def selftest(args) -> int:
         ok = path.is_file() and (not spec.sha256 or models.sha256_of(path) == spec.sha256)
         out.append(f"model {spec.id}: {'ok' if ok else 'MISSING/BAD'}")
         if not ok:
-            print("\n".join(out))
-            return 2
+            return finish(2)
     from .face.pipeline import FaceEngine
 
     engine = FaceEngine("dual")
@@ -146,8 +160,8 @@ def selftest(args) -> int:
         img = cv2.imread(args.selftest_image)
         a = engine.analyze(img, embed=True)
         if a.face is None:
-            print("\n".join(out + ["no face detected in self-test image"]))
-            return 3
+            out.append("no face detected in self-test image")
+            return finish(3)
         emb = engine.embed_all(a.chip)
         out.append(f"face detected; embeddings: {', '.join(f'{k}:{v.shape[0]}' for k, v in emb.items())};"
                    f" liveness {engine.liveness.score(img, a.face):.3f}")
@@ -166,9 +180,7 @@ def selftest(args) -> int:
             out.append(f"report {rid}: {pages} page(s)")
         db.close()
     del app
-    print("\n".join(out))
-    print("SELFTEST OK")
-    return 0
+    return finish(0)
 
 
 def main(argv=None) -> int:
@@ -179,6 +191,7 @@ def main(argv=None) -> int:
     ap.add_argument("--camera-source", default="", help="رقم كاميرا أو ملف فيديو أو مجلد صور")
     ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--selftest-image", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--selftest-out", default="", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.data_dir:
         os.environ["HADIR_DATA_DIR"] = args.data_dir

@@ -177,9 +177,12 @@ class MainWindow(QMainWindow):
                 folder = backups_dir(db.settings.get("backup.dir") or "")
                 maintenance.backup(db, folder, bool(db.settings.get("backup.include_snapshots")), "auto")
                 maintenance.prune_backups(folder, int(db.settings.get("backup.keep") or 30))
-                purge_snapshots(snapshots_dir(), int(db.settings.get("kiosk.snapshot_days") or 0), db.now())
         except Exception as exc:  # e.g. USB backup folder not plugged in
             db.events.add("backup", f"تعذّر إنشاء النسخة الاحتياطية التلقائية: {exc}")
+        today = db.now().date().isoformat()
+        if db.settings.get("maintenance.last_purge") != today:
+            purge_snapshots(snapshots_dir(), int(db.settings.get("kiosk.snapshot_days") or 0), db.now())
+            db.settings.set("maintenance.last_purge", today, audit=False)
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):
