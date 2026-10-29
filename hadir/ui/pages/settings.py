@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import base64
 import sys
+import threading
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QTimer
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QPushButton,
+                               QTabWidget, QVBoxLayout, QWidget)
 
 from ... import APP_SUBTITLE, APP_TITLE, __version__
 from ...core import maintenance
@@ -19,12 +20,42 @@ from ...core.timeutil import Fmt, digits
 from ...db.store import StoreError
 from ...face import models
 from ...face.camera import list_cameras
+from ...notify import telegram
 from ...paths import backups_dir, data_dir, db_path, snapshots_dir
 from ..admin import Page
 from ..theme import C, apply_theme
+from .schedules import RulesOverview
 from ..widgets.camera_view import CameraView
 from ..widgets.common import (DataTable, PageHeader, SpinBox, button, confirm, digit_locale, error,
                               info, label)
+
+
+class _Job(QObject):
+    done = Signal(object)
+
+
+def run_in_background(parent, fn, on_done) -> None:
+    """Run ``fn`` in a thread; ``on_done(result or exception)`` is called in the GUI thread."""
+    job = _Job(parent)
+    job.done.connect(on_done)
+    job.done.connect(lambda _: job.deleteLater())
+
+    def work():
+        try:
+            result = fn()
+        except Exception as exc:
+            result = exc
+        job.done.emit(result)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def valid_hhmm(text: str) -> str | None:
+    """'7:5' / '07:05' -> '07:05'; None when it is not a time of day."""
+    hh, _, mm = text.strip().partition(":")
+    if hh.strip().isdigit() and mm.strip().isdigit() and int(hh) < 24 and int(mm) < 60:
+        return f"{int(hh):02d}:{int(mm):02d}"
+    return None
 
 
 def combo(items: dict, value) -> QComboBox:
@@ -181,13 +212,75 @@ class SettingsPage(Page):
 
         # rules
         f = self._tab("قواعد الدوام")
+        self.rules_view = RulesOverview(self.db)
+        self.tabs.widget(self.tabs.count() - 1)._outer.insertWidget(0, self.rules_view)
         W["attendance.day_start"] = QLineEdit(s["attendance.day_start"])
         W["attendance.day_start"].setInputMask("99:99")
         f.addRow("بداية اليوم (البصمات قبلها تُحسب لليوم السابق):", W["attendance.day_start"])
         W["attendance.dedupe_seconds"] = SpinBox(0, 900, int(s["attendance.dedupe_seconds"]), " ثانية")
         f.addRow("دمج البصمات المتقاربة خلال:", W["attendance.dedupe_seconds"])
-        f.addRow(label("قواعد التأخير والسماح ونوافذ البصمة لكل جدول تُضبط من صفحة «جداول الدوام».", "Hint",
-                       wrap=True))
+
+        # telegram
+        f = self._tab("تلغرام")
+        outer = self.tabs.widget(self.tabs.count() - 1)._outer
+        outer.insertWidget(0, label(
+            "يرسل البرنامج إلى مجموعة أو قناة تلغرام رسالة عند كل تسجيل حضور أو انصراف (الاسم والصفة"
+            " الوظيفية ووقت الدخول والخروج)، وقائمة يومية بأسماء الموظفين وحالاتهم. هذه الميزة وحدها تحتاج إلى"
+            " إنترنت: إن انقطع الاتصال تُحفظ الرسائل وتُرسل عند عودته، ويبقى تسجيل الحضور يعمل كالمعتاد.",
+            wrap=True))
+        W["telegram.enabled"] = QCheckBox("تفعيل إشعارات تلغرام")
+        W["telegram.enabled"].setChecked(bool(s["telegram.enabled"]))
+        f.addRow("", W["telegram.enabled"])
+        W["telegram.token"] = QLineEdit(s["telegram.token"])
+        W["telegram.token"].setEchoMode(QLineEdit.Password)
+        W["telegram.token"].setPlaceholderText("123456789:AAH…")
+        W["telegram.token"].setLayoutDirection(Qt.LeftToRight)
+        show = QCheckBox("إظهار")
+        show.toggled.connect(lambda on: W["telegram.token"].setEchoMode(
+            QLineEdit.Normal if on else QLineEdit.Password))
+        row = QHBoxLayout()
+        row.addWidget(W["telegram.token"], 1)
+        row.addWidget(show)
+        f.addRow("رمز البوت (Bot Token):", row)
+        W["telegram.chat_id"] = QLineEdit(s["telegram.chat_id"])
+        W["telegram.chat_id"].setPlaceholderText("-1001234567890")
+        W["telegram.chat_id"].setLayoutDirection(Qt.LeftToRight)
+        find = button("بحث عن المجموعة", "search")
+        find.clicked.connect(self._tg_find)
+        row = QHBoxLayout()
+        row.addWidget(W["telegram.chat_id"], 1)
+        row.addWidget(find)
+        f.addRow("معرّف المجموعة أو القناة:", row)
+        W["telegram.punches"] = QCheckBox("رسالة عند كل تسجيل حضور أو انصراف")
+        W["telegram.punches"].setChecked(bool(s["telegram.punches"]))
+        f.addRow("", W["telegram.punches"])
+        W["telegram.daily_list"] = QCheckBox("قائمة الحضور اليومية بالأسماء، الساعة")
+        W["telegram.daily_list"].setChecked(bool(s["telegram.daily_list"]))
+        W["telegram.daily_time"] = QLineEdit(s["telegram.daily_time"])
+        W["telegram.daily_time"].setInputMask("99:99")
+        W["telegram.daily_time"].setMaximumWidth(90)
+        row = QHBoxLayout()
+        row.addWidget(W["telegram.daily_list"])
+        row.addWidget(W["telegram.daily_time"])
+        row.addStretch(1)
+        f.addRow("", row)
+        self.tg_test = button("إرسال رسالة تجريبية", "send", "primary")
+        self.tg_test.clicked.connect(self._tg_test)
+        self.tg_list = button("إرسال قائمة اليوم الآن", "report")
+        self.tg_list.clicked.connect(self._tg_send_list)
+        row = QHBoxLayout()
+        row.addWidget(self.tg_test)
+        row.addWidget(self.tg_list)
+        row.addStretch(1)
+        f.addRow("", row)
+        self.tg_status = label("", "Hint", wrap=True)
+        f.addRow("الحالة:", self.tg_status)
+        outer.insertWidget(2, label(
+            "كيف تحصل على الرمز والمعرّف؟\n"
+            "١. افتح في تلغرام الحساب ‎@BotFather وأرسل ‎/newbot واتبع الخطوات؛ سيعطيك «رمز البوت».\n"
+            "٢. أضف البوت إلى مجموعتك، أو اجعله مشرفاً في القناة.\n"
+            "٣. أرسل في المجموعة ‎/start ثم اضغط هنا «بحث عن المجموعة».\n"
+            "٤. اضغط «إرسال رسالة تجريبية» للتأكد، ثم «حفظ الإعدادات».", "Hint", wrap=True))
 
         # backup
         f = self._tab("النسخ الاحتياطي")
@@ -242,7 +335,8 @@ class SettingsPage(Page):
         w = QWidget()
         al = QVBoxLayout(w)
         al.addWidget(label(f"{APP_TITLE} — {APP_SUBTITLE}", "PageTitle"))
-        al.addWidget(label(f"الإصدار {__version__} • يعمل دون إنترنت؛ لا تُرسل أي بيانات خارج هذا الجهاز.", wrap=True))
+        self.about_lbl = label("", wrap=True)
+        al.addWidget(self.about_lbl)
         al.addWidget(label(f"قاعدة البيانات: {db_path()}\nصور الأدلة: {snapshots_dir()}", "Hint", wrap=True))
         al.addWidget(label("المكونات مفتوحة المصدر: Qt (LGPL)، OpenCV (Apache-2.0)، ONNX Runtime (MIT)،"
                            " نماذج YuNet (MIT)، SFace وArcFace (Apache-2.0)، MiniFASNet (Apache-2.0)،"
@@ -309,6 +403,12 @@ class SettingsPage(Page):
             self.w["backup.dir"].setText(d)
 
     def refresh(self):
+        self.rules_view.reload()
+        self._tg_status()
+        privacy = ("إشعارات تلغرام مفعّلة: تُرسل أسماء الموظفين وصفاتهم وأوقات حضورهم إلى مجموعة تلغرام"
+                   " المحددة، ولا يُرسل غير ذلك." if telegram.enabled(self.db) else
+                   "لا تُرسل أي بيانات خارج هذا الجهاز.")
+        self.about_lbl.setText(f"الإصدار {__version__} • يعمل دون إنترنت. {privacy}")
         last = self.db.settings.get("backup.last")
         self.last_backup.setText(digits(last[:16]) if last else "لم تُنشأ بعد")
         rows = []
@@ -350,11 +450,19 @@ class SettingsPage(Page):
         if not values["org.name"]:
             error(self, "اسم الدائرة مطلوب.")
             return
-        hh, _, mm = values["attendance.day_start"].partition(":")
-        if not (hh.isdigit() and mm.isdigit() and int(hh) < 24 and int(mm) < 60):
+        day_start = valid_hhmm(values["attendance.day_start"])
+        if day_start is None:
             error(self, "وقت «بداية اليوم» غير صحيح؛ اكتبه بصيغة ساعة:دقيقة مثل 04:00.")
             return
-        values["attendance.day_start"] = f"{int(hh):02d}:{int(mm):02d}"
+        values["attendance.day_start"] = day_start
+        daily_time = valid_hhmm(values["telegram.daily_time"])
+        if daily_time is None:
+            error(self, "وقت قائمة الحضور اليومية غير صحيح؛ اكتبه مثل 17:05.")
+            return
+        values["telegram.daily_time"] = daily_time
+        if values["telegram.enabled"] and not (values["telegram.token"] and values["telegram.chat_id"]):
+            error(self, "لتفعيل إشعارات تلغرام أدخل رمز البوت ومعرّف المجموعة.")
+            return
         old = self.db.settings.all()
         self.db.settings.set_many(values)
         self.ctx.reload_settings()
@@ -371,10 +479,75 @@ class SettingsPage(Page):
             cam.width, cam.height = values["camera.width"], values["camera.height"]
             cam.start()
         self.ctx.worker.configure(self.ctx._settings)
+        if self.ctx.telegram:
+            self.ctx.telegram.wake()
+        self.refresh()
         msg = "تم حفظ الإعدادات."
         if values["recog.engine"] != old["recog.engine"]:
             msg += "\nتغيير محرك التعرّف يتطلب إعادة تشغيل البرنامج."
         info(self, msg)
+
+    # ---------------------------------------------------------- telegram
+    def _tg_status(self):
+        st = self.db.outbox.status()
+        parts = [f"بانتظار الإرسال: {digits(st['pending'])}",
+                 f"آخر إرسال: {digits(st['last_sent'][:16])}" if st["last_sent"] else "لم يُرسل شيء بعد"]
+        if st["error"]:
+            parts.append(f"آخر خطأ: {st['error']}")
+        self.tg_status.setText(" • ".join(parts))
+
+    def _tg_test(self):
+        token = self.w["telegram.token"].text().strip()
+        chat = self.w["telegram.chat_id"].text().strip()
+        if not token or not chat:
+            error(self, "أدخل رمز البوت ومعرّف المجموعة أولاً.")
+            return
+        text = (f"✅ رسالة تجريبية من برنامج «حاضر» — {self.w['org.name'].text().strip()}\n"
+                "ستصل إلى هنا إشعارات الحضور والانصراف.")
+        self.tg_test.setEnabled(False)
+        run_in_background(self, lambda: telegram.send_message(token, chat, text), self._tg_test_done)
+
+    def _tg_test_done(self, result):
+        self.tg_test.setEnabled(True)
+        if isinstance(result, Exception):
+            error(self, f"لم تُرسل الرسالة:\n{result}")
+        else:
+            info(self, "وصلت الرسالة التجريبية إلى المجموعة. لا تنسَ «حفظ الإعدادات».")
+
+    def _tg_find(self):
+        token = self.w["telegram.token"].text().strip()
+        if not token:
+            error(self, "أدخل رمز البوت أولاً.")
+            return
+        run_in_background(self, lambda: telegram.find_chats(token), self._tg_found)
+
+    def _tg_found(self, result):
+        if isinstance(result, Exception):
+            error(self, str(result))
+            return
+        if not result:
+            info(self, "لم يُعثر على مجموعة بعد. أضف البوت إلى المجموعة وأرسل فيها ‎/start ثم أعد المحاولة.")
+            return
+        items = [f"{title} ({cid})" for cid, title in result]
+        choice, ok = (items[0], True) if len(items) == 1 else QInputDialog.getItem(
+            self, "اختيار المجموعة", "المجموعات التي وصل منها البوت:", items, 0, False)
+        if not ok:
+            return
+        cid, title = result[items.index(choice)]
+        self.w["telegram.chat_id"].setText(cid)
+        info(self, f"اختيرت المجموعة «{title}». اضغط «إرسال رسالة تجريبية» للتأكد ثم «حفظ الإعدادات».")
+
+    def _tg_send_list(self):
+        if not telegram.enabled(self.db):
+            error(self, "فعّل إشعارات تلغرام واحفظ الإعدادات أولاً.")
+            return
+        if not telegram.queue_daily_list(self.db, self.db.now().date()):
+            info(self, "لا يوجد دوام اليوم، فلم تُرسل قائمة.")
+            return
+        if self.ctx.telegram:
+            self.ctx.telegram.wake()
+        self._tg_status()
+        self.toast("أُضيفت قائمة اليوم إلى الإرسال", "ok")
 
     # ------------------------------------------------------------ backup
     def _backup_now(self):

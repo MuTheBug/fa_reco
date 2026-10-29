@@ -1,8 +1,76 @@
-"""SQLite schema and forward-only migrations."""
+"""SQLite schema and forward-only migrations.
+
+A migration is an SQL script, or a list of SQL scripts and Python steps; a
+Python step is called as ``step(conn, now)`` inside the migration's transaction.
+"""
 
 from __future__ import annotations
 
-MIGRATIONS: list[str] = [
+from datetime import datetime, timedelta
+
+SEED_SCHEDULE = "الدوام الرسمي"
+# The department's rules: Sunday-Thursday from 08:00, on time until 08:30, absent after 09:00,
+# exit from 14:45 (leaving earlier or not punching counts as an absence), exit punches until 17:00.
+SEED_RULES = dict(grace_late=30, absent_after=60, exit_until="17:00", early_absent=1, missing_absent=1)
+SEED_START, SEED_END = "08:00", "14:45"
+
+
+def upgrade_seed_schedule(conn, now: datetime) -> None:
+    """Give the first-run schedule of version 1.0, if nobody changed it, the department's rules.
+
+    Days before the upgrade keep the rules they were recorded under: the old schedule is kept
+    (renamed, inactive) for them and the updated one takes over from the upgrade day.
+    """
+    row = conn.execute("SELECT * FROM schedules WHERE name = ?", (SEED_SCHEDULE,)).fetchone()
+    if row is None:
+        return
+    rules = tuple(row[k] for k in ("kind", "grace_late", "grace_early", "late_after_grace",
+                                   "window_before", "window_after", "overtime_min", "notes", "active"))
+    if rules != ("weekly", 10, 0, 0, 240, 480, 30, "", 1):
+        return
+    days = {r["day_index"]: (r["workday"], r["start_time"], r["end_time"])
+            for r in conn.execute("SELECT * FROM schedule_days WHERE schedule_id = ?", (row["id"],))}
+    seed = {i: (1, "08:00", "14:00") if i not in (4, 5) else (0, None, None) for i in range(7)}
+    if days != seed:
+        return
+    old = row["id"]
+    today = now.date()
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    history = (conn.execute("SELECT COUNT(*) FROM schedule_assignments WHERE schedule_id = ? AND"
+                            " start_date < ?", (old, today.isoformat())).fetchone()[0]
+               and conn.execute("SELECT COUNT(*) FROM punches WHERE ts < ?",
+                                (today.isoformat(),)).fetchone()[0])
+    if history:
+        until = (today - timedelta(days=1)).strftime("%Y/%m/%d")
+        conn.execute("UPDATE schedules SET name = ?, active = 0 WHERE id = ?",
+                     (f"{SEED_SCHEDULE} (حتى {until})", old))
+        new = conn.execute("INSERT INTO schedules (name, kind, created_at) VALUES (?, 'weekly', ?)",
+                           (SEED_SCHEDULE, stamp)).lastrowid
+        for a in conn.execute("SELECT * FROM schedule_assignments WHERE schedule_id = ? AND start_date"
+                              " <= ? AND (end_date IS NULL OR end_date >= ?)",
+                              (old, today.isoformat(), today.isoformat())).fetchall():
+            conn.execute("INSERT INTO schedule_assignments (schedule_id, group_id, employee_id, start_date,"
+                         " end_date, note, created_at) VALUES (?,?,?,?,?,?,?)",
+                         (new, a["group_id"], a["employee_id"], today.isoformat(), a["end_date"],
+                          "قواعد الدوام الجديدة", stamp))
+        conn.execute("UPDATE schedule_assignments SET schedule_id = ? WHERE schedule_id = ? AND start_date > ?",
+                     (new, old, today.isoformat()))
+    else:
+        new = old
+        conn.execute("DELETE FROM schedule_days WHERE schedule_id = ?", (new,))
+    conn.execute(f"UPDATE schedules SET {', '.join(k + ' = ?' for k in SEED_RULES)} WHERE id = ?",
+                 (*SEED_RULES.values(), new))
+    for i in range(7):
+        work = i not in (4, 5)
+        conn.execute("INSERT INTO schedule_days (schedule_id, day_index, workday, start_time, end_time)"
+                     " VALUES (?,?,?,?,?)", (new, i, int(work), SEED_START if work else None,
+                                             SEED_END if work else None))
+    conn.execute("INSERT INTO audit_log (ts, username, action, entity, entity_id, details)"
+                 " VALUES (?, 'النظام', 'تطبيق قواعد الدوام الجديدة', 'schedule', ?, ?)",
+                 (stamp, new, f"اعتباراً من {today.isoformat()}"))
+
+
+MIGRATIONS: list = [
     # 1 -- initial schema
     """
     CREATE TABLE settings (
@@ -232,4 +300,37 @@ MIGRATIONS: list[str] = [
         updated_at TEXT NOT NULL
     );
     """,
+    # 2 -- strict attendance rules, Telegram outbox, automatic hire dates
+    [
+        """
+        ALTER TABLE schedules ADD COLUMN absent_after INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE schedules ADD COLUMN exit_until TEXT;
+        ALTER TABLE schedules ADD COLUMN early_absent INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE schedules ADD COLUMN missing_absent INTEGER NOT NULL DEFAULT 0;
+
+        -- Messages for Telegram wait here until they are sent, so none is lost while offline.
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            sent_at TEXT,
+            dropped INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_outbox_pending ON outbox(sent_at, dropped);
+
+        -- The hire date is no longer typed in: people count from the day they were added (or
+        -- from their first punch or leave, if earlier).
+        UPDATE employees SET hire_date = MIN(
+            substr(created_at, 1, 10),
+            COALESCE((SELECT substr(MIN(p.ts), 1, 10) FROM punches p WHERE p.employee_id = employees.id),
+                     '9999-12-31'),
+            COALESCE((SELECT MIN(l.start_date) FROM leaves l WHERE l.employee_id = employees.id),
+                     '9999-12-31'))
+        WHERE hire_date IS NULL;
+        """,
+        upgrade_seed_schedule,
+    ],
 ]

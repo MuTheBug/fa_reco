@@ -11,6 +11,7 @@ from .core.timeutil import digits, fmt_minutes, fmt_time, parse_dt
 from .db.store import Database
 from .face.pipeline import Decision, FaceEngine
 from .face.service import maybe_adapt, save_snapshot
+from .notify import telegram
 from .paths import snapshots_dir
 
 
@@ -45,19 +46,28 @@ def describe_day(rec: E.DayRecord, punch_type: str, ts: datetime) -> list[str]:
     elif rec.status == E.LEAVE:
         lines.append(f"لديك {rec.leave.type.name} اليوم" if rec.leave else "لديك إجازة اليوم")
     elif rec.shift is not None:
+        absent = rec.status == E.ABSENT
         if punch_type == "in":
-            if rec.late:
+            if absent and "absent_late" in rec.flags:
+                lines.append("حضور بعد وقت الغياب — يُحتسب اليوم غياباً")
+            elif rec.late:
                 lines.append(f"متأخر {_minutes_text(rec.late)}")
             else:
                 lines.append("في الموعد — يوم موفق")
             lines.append(f"دوامك من {fmt_time(rec.shift.start)} إلى {fmt_time(rec.shift.end)}")
         else:
-            if rec.early:
+            if absent and "absent_early" in rec.flags:
+                lines.append(f"خروج قبل الساعة {fmt_time(rec.shift.end)} — يُحتسب غياباً ما لم تكن لديك إجازة")
+            elif absent and "absent_late" in rec.flags:
+                lines.append("حضرت اليوم بعد وقت الغياب — اليوم محسوب غياباً")
+            elif rec.early:
                 lines.append(f"خروج مبكر بـ {_minutes_text(rec.early)}")
             elif rec.overtime:
                 lines.append(f"عمل إضافي {_minutes_text(rec.overtime)}")
             if rec.check_in:
                 lines.append(f"الحضور {fmt_time(rec.check_in)} — مدة الدوام {fmt_minutes(rec.worked)}")
+            elif absent:
+                lines.append("لا يوجد تسجيل حضور لهذا اليوم — يُحتسب غياباً")
             else:
                 lines.append("لا يوجد تسجيل حضور لهذا اليوم")
     return lines
@@ -100,13 +110,26 @@ class KioskLogic:
                                    employee_id, emp["full_name"], emp["code"], ts=ts)
         [data] = self.db.load_employees([employee_id], ts.date() - timedelta(days=1), ts.date())
         punch_type, rec = E.classify_new_punch(data, self.db.load_org(), ts)
+        deadline = rec.schedule.exit_deadline(rec.shift) if rec.schedule and rec.shift else None
+        if deadline is not None and ts > deadline:
+            # No punches once the day's last exit time has passed; the admin sees the attempt.
+            snap = self._snapshot(frame, box, ts, "late")
+            self.db.events.add("late_punch", f"محاولة بصمة الساعة {fmt_time(ts)} بعد آخر وقت للخروج"
+                               f" ({fmt_time(deadline)})", employee_id, snap)
+            return KioskResult("closed", "bad", "انتهى وقت تسجيل الخروج لهذا اليوم",
+                               [f"آخر وقت للبصمة كان الساعة {fmt_time(deadline)}",
+                                "راجع مسؤول النظام إن احتجت إلى تصحيح"],
+                               employee_id, emp["full_name"], emp["code"], ts=ts)
         snap = self._snapshot(frame, box, ts, f"{emp['code']}")
         if source == "face":
             pid = self.db.punches.add_face(employee_id, ts, score, liveness, snap)
         else:
             pid = self.db.punches.add_face(employee_id, ts, None, None, snap, source=source)
+        telegram.queue_punch(self.db, emp, punch_type, rec, ts)
         title = "تم تسجيل الحضور" if punch_type == "in" else "تم تسجيل الانصراف"
-        return KioskResult("punched", "ok", title, describe_day(rec, punch_type, ts), employee_id,
+        # The punch is recorded either way; an absence under the rules is shown as a warning.
+        tone = "warn" if rec.status == E.ABSENT else "ok"
+        return KioskResult("punched", tone, title, describe_day(rec, punch_type, ts), employee_id,
                            emp["full_name"], emp["code"], punch_type, ts, pid)
 
     def handle(self, decision: Decision, frame, ts: datetime, security_threshold: float) -> KioskResult:

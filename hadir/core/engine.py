@@ -18,6 +18,11 @@ Key rules
   check-in or a check-out depending on which shift edge it is nearer to,
   unless it was explicitly entered as one.
 * Hourly leaves excuse lateness/early leaving that they cover.
+* Optional strict rules per schedule: arriving more than ``absent_after``
+  minutes after the start, leaving before the exit time (``early_absent``) or
+  a missing check-in/check-out (``missing_absent``) make the day an absence.
+  ``exit_until`` is the last time an exit punch is accepted; a missing
+  check-out is final only after it.
 """
 
 from __future__ import annotations
@@ -60,7 +65,12 @@ FLAG_LABELS = {
     "at_work": "في الدوام",
     "low_liveness": "تحقق حيوية ضعيف",
     "overdue": "تجاوز وقت الحضور",
+    "absent_late": "حضر بعد وقت الغياب",
+    "absent_early": "خرج قبل وقت الخروج",
 }
+
+# Why a day with punches still counts as an absence, in the order they are reported.
+ABSENCE_REASONS = ("absent_late", "absent_early", "missing_in", "missing_out")
 
 
 # --------------------------------------------------------------------------
@@ -97,6 +107,10 @@ class Schedule:
     window_before: int = 240
     window_after: int = 480
     overtime_min: int = 30
+    absent_after: int = 0  # minutes after the start; a later arrival is an absence (0 = off)
+    exit_until: time | None = None  # last exit punch; a missing check-out is final after it
+    early_absent: bool = False  # leaving before the exit time is an absence, not an early leave
+    missing_absent: bool = False  # a missing check-in or check-out makes the day an absence
 
     def rule_for(self, d: date) -> DayRule | None:
         if not self.days:
@@ -115,6 +129,15 @@ class Schedule:
         if end <= start:
             end += timedelta(days=1)
         return Shift(d, start, end)
+
+    def exit_deadline(self, shift: Shift) -> datetime | None:
+        """The first ``exit_until`` at or after the end of the shift."""
+        if self.exit_until is None:
+            return None
+        deadline = datetime.combine(shift.end.date(), self.exit_until)
+        if deadline < shift.end:
+            deadline += timedelta(days=1)
+        return deadline
 
 
 @dataclass(frozen=True)
@@ -281,11 +304,20 @@ class DayRecord:
             self.status == LEAVE and self.leave is not None and self.leave.type.counts_present)
 
     @property
+    def absence_reason(self) -> str:
+        """Why a day with punches counts as an absence ("" if it does not)."""
+        if self.status != ABSENT:
+            return ""
+        return next((FLAG_LABELS[f] for f in ABSENCE_REASONS if f in self.flags), "")
+
+    @property
     def label(self) -> str:
         if self.status == LEAVE and self.leave is not None:
             return self.leave.type.name
         if self.status == HOLIDAY and self.holiday is not None:
             return self.holiday.name
+        if self.status == ABSENT and self.absence_reason:
+            return f"{STATUS_LABELS[ABSENT]} ({self.absence_reason})"
         if self.status == PRESENT:
             parts = []
             if self.late:
@@ -353,6 +385,9 @@ def compute_days(emp: EmployeeData, org: OrgData, start: date, end: date,
         if shift is not None:
             ws = shift.start - timedelta(minutes=schedule.window_before)
             we = shift.end + timedelta(minutes=schedule.window_after)
+            deadline = schedule.exit_deadline(shift)
+            if deadline is not None and deadline > we:
+                we = deadline
         else:
             ws = datetime.combine(d, org.day_start)
             we = ws + timedelta(days=1)
@@ -487,10 +522,18 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
         rec.status, rec.leave = LEAVE, hourly[0][2]
         return rec
 
+    # An hourly leave at the start of the day moves the start (and the absence cutoff) with it.
+    eff_start = shift.start
+    grace = timedelta(minutes=schedule.grace_late)
+    for s, e, _ in hourly:
+        if s <= eff_start + grace and e > eff_start:
+            eff_start = e
+    cutoff = eff_start + timedelta(minutes=schedule.absent_after) if schedule.absent_after else None
+
     if not punches:
         if today is not None and d > today:
             rec.status = FUTURE
-        elif not shift_over:
+        elif not shift_over and (cutoff is None or now <= cutoff):
             rec.status = PENDING
             if now >= shift.start + timedelta(minutes=schedule.grace_late):
                 rec.flags.add("overdue")
@@ -499,18 +542,21 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
         return rec
 
     rec.status = PRESENT
+    absence = []
     if rec.check_in is not None:
-        eff_start = shift.start
-        grace = timedelta(minutes=schedule.grace_late)
-        for s, e, _ in hourly:
-            if s <= eff_start + grace and e > eff_start:
-                eff_start = e
-        if rec.check_in > eff_start + grace:
+        if cutoff is not None and rec.check_in > cutoff:
+            absence.append("absent_late")
+        elif rec.check_in > eff_start + grace:
             base = eff_start + grace if schedule.late_after_grace else eff_start
             rec.late = minutes_between(base, rec.check_in)
     else:
         rec.flags.add("missing_in")
+        if schedule.missing_absent:
+            absence.append("missing_in")
 
+    # A check-out is still possible until the last exit time.
+    deadline = schedule.exit_deadline(shift)
+    exit_closed = now is None or now >= (deadline or shift.end)
     if rec.check_out is not None:
         eff_end = shift.end
         grace = timedelta(minutes=schedule.grace_early)
@@ -518,15 +564,25 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
             if e >= eff_end - grace and s < eff_end:
                 eff_end = s
         if rec.check_out < eff_end - grace:
-            rec.early = minutes_between(rec.check_out, eff_end)
+            if schedule.early_absent:
+                absence.append("absent_early")
+            else:
+                rec.early = minutes_between(rec.check_out, eff_end)
         if rec.check_out > shift.end:
             extra = minutes_between(shift.end, rec.check_out)
             if extra >= schedule.overtime_min:
                 rec.overtime = extra
-    elif shift_over:
+    elif exit_closed:
         rec.flags.add("missing_out")
+        if schedule.missing_absent:
+            absence.append("missing_out")
     else:
         rec.flags.add("at_work")
+
+    if absence:
+        rec.status = ABSENT
+        rec.flags.update(f for f in absence if f.startswith("absent_"))
+        rec.late = rec.early = rec.overtime = 0
     return rec
 
 

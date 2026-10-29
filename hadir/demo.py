@@ -22,6 +22,7 @@ JOBS = ["مهندس", "محاسب", "ملاحظ", "مبرمج", "معاون إد
 
 def populate(db: Database, today: date, employees: int = 24, days: int = 35, seed: int = 7) -> None:
     rnd = random.Random(seed)
+    phones = random.Random(seed + 1)  # separate stream: the attendance data stays the same
     seed_defaults(db)
     with db.tx():
         base_group = db.scalar("SELECT id FROM emp_groups ORDER BY id")
@@ -45,6 +46,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
             name = f"{rnd.choice(FIRST)} {rnd.choice(FATHER)} {rnd.choice(FAMILY)}"
             eid = db.employees.save(dict(
                 code=str(1001 + i), full_name=name, job_title=rnd.choice(JOBS),
+                phone=f"07{phones.choice('789')}{phones.randint(0, 99_999_999):08d}",
                 department=rnd.choice(["الإدارة", "الحسابات", "الشؤون الفنية", "الخدمات"]),
                 hire_date=(start - timedelta(days=400)).isoformat(), group_id=plan[i]),
                 group_effective="2000-01-01")
@@ -86,7 +88,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
                     arrive += timedelta(minutes=rnd.randint(15, 70))
                 if d == hourly_day and eid == pick(1):
                     arrive = shift.start + timedelta(minutes=118)
-                leave = shift.end + timedelta(minutes=rnd.gauss(4, 5))
+                leave = shift.end + timedelta(minutes=1 + abs(rnd.gauss(4, 5)))
                 if rnd.random() < 0.05:
                     leave -= timedelta(minutes=rnd.randint(20, 90))
                 if rnd.random() < 0.07:
@@ -109,7 +111,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
         miss_day = today - timedelta(days=4)
         while miss_day.weekday() in (4, 5):
             miss_day -= timedelta(days=1)
-        db.punches.add_manual(pick(3), datetime.combine(miss_day, datetime.min.time()).replace(hour=14, minute=5),
+        db.punches.add_manual(pick(3), datetime.combine(miss_day, datetime.min.time()).replace(hour=14, minute=50),
                               "out", "نسي تسجيل الانصراف — بموافقة المدير المباشر")
 
 

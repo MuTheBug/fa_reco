@@ -18,8 +18,7 @@ DAILY_FIELDS = [
     ("code", "الرقم الوظيفي", "text", ""),
     ("name", "الاسم", "text", ""),
     ("group", "المجموعة", "text", ""),
-    ("department", "القسم", "text", ""),
-    ("job_title", "العنوان الوظيفي", "text", ""),
+    ("job_title", "الصفة الوظيفية", "text", ""),
     ("schedule", "جدول الدوام", "text", ""),
     ("shift_start", "بداية الدوام", "time", ""),
     ("shift_end", "نهاية الدوام", "time", ""),
@@ -42,8 +41,7 @@ SUMMARY_FIELDS = [
     ("code", "الرقم الوظيفي", "text", ""),
     ("name", "الاسم", "text", ""),
     ("group", "المجموعة", "text", ""),
-    ("department", "القسم", "text", ""),
-    ("job_title", "العنوان الوظيفي", "text", ""),
+    ("job_title", "الصفة الوظيفية", "text", ""),
     ("workdays", "أيام الدوام", "int", "sum"),
     ("present", "أيام الحضور", "int", "sum"),
     ("absent", "أيام الغياب", "int", "sum"),
@@ -109,15 +107,11 @@ CORRECTION_FIELDS = [
 EMPLOYEE_FIELDS = [
     ("code", "الرقم الوظيفي", "text", ""),
     ("name", "الاسم", "text", ""),
-    ("job_title", "العنوان الوظيفي", "text", ""),
-    ("department", "القسم", "text", ""),
+    ("job_title", "الصفة الوظيفية", "text", ""),
+    ("phone", "رقم الهاتف", "text", ""),
     ("group", "المجموعة", "text", ""),
-    ("hire_date", "تاريخ المباشرة", "date", ""),
-    ("end_date", "تاريخ ترك الخدمة", "date", ""),
     ("active", "فعّال", "text", ""),
     ("samples", "عينات الوجه", "int", "sum"),
-    ("phone", "الهاتف", "text", ""),
-    ("notes", "ملاحظات", "text", ""),
 ]
 
 SOURCES = {

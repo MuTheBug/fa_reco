@@ -20,7 +20,7 @@ import numpy as np
 
 from ..core import engine as E
 from ..core.security import hash_password, verify_password
-from ..core.settings import DEFAULTS
+from ..core.settings import DEFAULTS, SECRET_KEYS
 from ..core.timeutil import iso_dt, parse_date, parse_dt, parse_time
 from .schema import MIGRATIONS
 
@@ -84,14 +84,19 @@ class Database:
         self.events = EventsRepo(self)
         self.audit_log = AuditRepo(self)
         self.templates = TemplatesRepo(self)
+        self.outbox = OutboxRepo(self)
 
     # ------------------------------------------------------------------ core
     def _migrate(self):
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-        for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
+        for i, steps in enumerate(MIGRATIONS[version:], start=version + 1):
             with self.tx():
-                for stmt in _split_sql(sql):
-                    self.conn.execute(stmt)
+                for step in steps if isinstance(steps, list) else [steps]:
+                    if callable(step):
+                        step(self.conn, self.now())
+                        continue
+                    for stmt in _split_sql(step):
+                        self.conn.execute(stmt)
                 self.conn.execute(f"PRAGMA user_version = {i}")
 
     @property
@@ -283,7 +288,7 @@ class SettingsRepo(_Repo):
                   " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                   (key, json.dumps(value, ensure_ascii=False)))
         if audit and old != value:
-            shown = "(صورة)" if key == "org.logo" else value
+            shown = "(صورة)" if key == "org.logo" else "(مخفي)" if key in SECRET_KEYS else value
             self.db.audit("تعديل إعداد", "settings", None, {"key": key, "value": shown})
 
     def set_many(self, values: dict) -> None:
@@ -429,7 +434,10 @@ class SchedulesRepo(_Repo):
                       for d in days)
         return E.Schedule(row["id"], row["name"], row["kind"], rules, parse_date(row["cycle_anchor"]),
                           row["grace_late"], row["grace_early"], bool(row["late_after_grace"]),
-                          row["window_before"], row["window_after"], row["overtime_min"])
+                          row["window_before"], row["window_after"], row["overtime_min"],
+                          absent_after=row["absent_after"], exit_until=parse_time(row["exit_until"]),
+                          early_absent=bool(row["early_absent"]),
+                          missing_absent=bool(row["missing_absent"]))
 
     def get(self, schedule_id: int) -> E.Schedule | None:
         row = self.db.one("SELECT * FROM schedules WHERE id = ?", (schedule_id,))
@@ -444,7 +452,8 @@ class SchedulesRepo(_Repo):
 
     def save(self, data: dict, schedule_id: int | None = None) -> int:
         """data: name, kind, cycle_anchor, grace_late, grace_early, late_after_grace,
-        window_before, window_after, overtime_min, notes, active,
+        window_before, window_after, overtime_min, absent_after, exit_until 'HH:MM' or None,
+        early_absent, missing_absent, notes, active,
         days: [(workday, start 'HH:MM', end 'HH:MM'), ...]"""
         name = (data.get("name") or "").strip()
         if not name:
@@ -466,15 +475,28 @@ class SchedulesRepo(_Repo):
         if dup:
             raise StoreError("يوجد جدول بهذا الاسم.")
         fields = ("name", "kind", "cycle_anchor", "grace_late", "grace_early", "late_after_grace",
-                  "window_before", "window_after", "overtime_min", "notes", "active")
+                  "window_before", "window_after", "overtime_min", "absent_after", "exit_until",
+                  "early_absent", "missing_absent", "notes", "active")
         defaults = {"cycle_anchor": None, "grace_late": 10, "grace_early": 0, "late_after_grace": 0,
-                    "window_before": 240, "window_after": 480, "overtime_min": 30, "notes": "",
+                    "window_before": 240, "window_after": 480, "overtime_min": 30, "absent_after": 0,
+                    "exit_until": None, "early_absent": 0, "missing_absent": 0, "notes": "",
                     "active": 1}
         values = {f: data.get(f, defaults.get(f)) for f in fields}
-        values["name"] = name
+        values["name"], values["kind"] = name, kind
         values["cycle_anchor"] = _d(values["cycle_anchor"]) if kind == "cycle" else None
-        for f in ("late_after_grace", "active"):
+        for f in ("late_after_grace", "early_absent", "missing_absent", "active"):
             values[f] = int(bool(values[f]))
+        values["absent_after"] = int(values["absent_after"] or 0)
+        values["exit_until"] = _t(values["exit_until"])
+        if values["absent_after"] and values["absent_after"] <= int(values["grace_late"]):
+            raise StoreError("وقت احتساب الغياب يجب أن يكون بعد انتهاء سماحية التأخير.")
+        if values["exit_until"]:
+            last = parse_time(values["exit_until"])
+            for wd, st, en in days:
+                st, en = parse_time(_t(st)), parse_time(_t(en))
+                if wd and st < en and last < en:
+                    raise StoreError(f"آخر وقت لبصمة الخروج ({values['exit_until']}) يسبق وقت الخروج"
+                                     f" ({_t(en)}) في أحد أيام الدوام.")
         with self.db.tx():
             if schedule_id is None:
                 cur = self.db.x(
@@ -569,40 +591,57 @@ class EmployeesRepo(_Repo):
         nums = [int(c) for c in codes if c.isdigit()]
         return str(max(nums) + 1 if nums else 1001)
 
+    FIELDS = ("code", "full_name", "job_title", "department", "phone", "notes", "hire_date",
+              "end_date", "active")
+
     def save(self, data: dict, employee_id: int | None = None, group_effective=None) -> int:
-        name = (data.get("full_name") or "").strip()
-        code = (data.get("code") or "").strip()
-        if not name:
+        """Add an employee or change the fields present in ``data`` (others are kept).
+
+        ``job_title`` holds the job description (الصفة الوظيفية).  A new employee gets the next
+        employee number and counts from today unless ``code``/``hire_date`` are given.  Switching
+        ``active`` off ends the service on the last day worked; switching it on reopens it.
+        """
+        old = self.db.one("SELECT * FROM employees WHERE id = ?", (employee_id,)) if employee_id else None
+        if employee_id is not None and old is None:
+            raise StoreError("الموظف غير موجود.")
+        today = self.db.now().date()
+        if old is None:
+            values = dict(code="", full_name="", job_title="", department="", phone="", notes="",
+                          hire_date=None, end_date=None, active=1)
+        else:
+            values = {f: old[f] for f in self.FIELDS}
+        values.update({f: data[f] for f in self.FIELDS if f in data})
+        for f in ("code", "full_name", "job_title", "department", "phone"):
+            values[f] = str(values[f] or "").strip()
+        values["notes"] = values["notes"] or ""
+        values["active"] = int(bool(values["active"]))
+        values["hire_date"], values["end_date"] = _d(values["hire_date"]), _d(values["end_date"])
+        if not values["full_name"]:
             raise StoreError("اسم الموظف مطلوب.")
-        if not code:
-            raise StoreError("الرقم الوظيفي مطلوب.")
-        dup = self.db.one("SELECT id FROM employees WHERE code = ? AND id <> ?", (code, employee_id or 0))
+        if not values["code"]:
+            values["code"] = self.next_code()
+        dup = self.db.one("SELECT id FROM employees WHERE code = ? AND id <> ?",
+                          (values["code"], employee_id or 0))
         if dup:
             raise StoreError("الرقم الوظيفي مستخدم لموظف آخر.")
-        hire, end = _d(data.get("hire_date")), _d(data.get("end_date"))
+        if old is None and not values["hire_date"]:
+            values["hire_date"] = today.isoformat()
+        if old is not None and "end_date" not in data and bool(old["active"]) != bool(values["active"]):
+            values["end_date"] = None if values["active"] else self._service_end(old, today)
+        hire, end = values["hire_date"], values["end_date"]
         if hire and end and end < hire:
             raise StoreError("تاريخ ترك الخدمة قبل تاريخ المباشرة.")
-        fields = ("code", "full_name", "job_title", "department", "phone", "notes", "hire_date",
-                  "end_date", "active")
-        values = {
-            "code": code, "full_name": name,
-            "job_title": (data.get("job_title") or "").strip(),
-            "department": (data.get("department") or "").strip(),
-            "phone": (data.get("phone") or "").strip(),
-            "notes": data.get("notes") or "",
-            "hire_date": hire, "end_date": end,
-            "active": int(bool(data.get("active", True))),
-        }
+        fields = self.FIELDS
         now = self.db.now_s()
         with self.db.tx():
-            if employee_id is None:
+            if old is None:
                 cur = self.db.x(f"INSERT INTO employees ({','.join(fields)}, created_at, updated_at)"
                                 f" VALUES ({','.join('?' * len(fields))}, ?, ?)",
                                 [values[f] for f in fields] + [now, now])
                 employee_id = cur.lastrowid
-                self.db.audit("إضافة موظف", "employee", employee_id, f"{code} - {name}")
+                self.db.audit("إضافة موظف", "employee", employee_id,
+                              f"{values['code']} - {values['full_name']}")
             else:
-                old = self.db.one("SELECT * FROM employees WHERE id = ?", (employee_id,))
                 self.db.x(f"UPDATE employees SET {','.join(f + ' = ?' for f in fields)},"
                           " updated_at = ? WHERE id = ?",
                           [values[f] for f in fields] + [now, employee_id])
@@ -610,10 +649,32 @@ class EmployeesRepo(_Repo):
                 if changes:
                     self.db.audit("تعديل موظف", "employee", employee_id, changes)
             if "group_id" in data:
-                self.set_group(employee_id, data["group_id"], group_effective or hire or "2000-01-01")
+                # A new employee belongs to the group from the start; hire_date decides when they count.
+                effective = group_effective or ("2000-01-01" if old is None else today)
+                self.set_group(employee_id, data["group_id"], effective)
             if "photo" in data and data["photo"] is not None:
                 self.set_photo(employee_id, data["photo"])
         return employee_id
+
+    def _service_end(self, row, today: date) -> str:
+        """Last day of service for someone switched off today: today if they punched today."""
+        punched = self.db.scalar("SELECT COUNT(*) FROM punches WHERE employee_id = ? AND deleted = 0"
+                                 " AND ts >= ?", (row["id"], today.isoformat()))
+        end = today if punched else today - timedelta(days=1)
+        hire = parse_date(row["hire_date"])
+        return max(end, hire).isoformat() if hire else end.isoformat()
+
+    def cover_day(self, employee_id: int, day: date) -> None:
+        """Count the employee from ``day`` when a record is entered for a day before their first."""
+        hire = self.db.scalar("SELECT hire_date FROM employees WHERE id = ?", (employee_id,))
+        if hire and day.isoformat() < hire:
+            self.db.x("UPDATE employees SET hire_date = ? WHERE id = ?", (day.isoformat(), employee_id))
+            self.db.audit("تقديم بداية احتساب الدوام", "employee", employee_id,
+                          {"from": day.isoformat(), "was": hire})
+
+    def default_group(self) -> int | None:
+        """The group new employees join when no group is chosen (the oldest active one)."""
+        return self.db.scalar("SELECT id FROM emp_groups WHERE active = 1 ORDER BY id LIMIT 1")
 
     def set_photo(self, employee_id: int, jpeg: bytes | None) -> None:
         self.db.x("UPDATE employees SET photo = ? WHERE id = ?", (jpeg, employee_id))
@@ -658,7 +719,7 @@ class EmployeesRepo(_Repo):
 
     def delete(self, employee_id: int) -> None:
         if self.db.scalar("SELECT COUNT(*) FROM punches WHERE employee_id = ?", (employee_id,)):
-            raise StoreError("لا يمكن حذف موظف له سجل دوام. اجعله «غير فعّال» أو حدّد تاريخ ترك الخدمة.")
+            raise StoreError("لا يمكن حذف موظف له سجل دوام؛ أزل علامة «فعّال» من بياناته بدلاً من ذلك.")
         with self.db.tx():
             row = self.db.one("SELECT code, full_name FROM employees WHERE id = ?", (employee_id,))
             self.db.x("DELETE FROM employees WHERE id = ?", (employee_id,))
@@ -851,6 +912,7 @@ class LeavesRepo(_Repo):
             self.db.audit("إضافة إجازة", "employee", employee_id,
                           {"type": t["name"], "from": start, "to": end,
                            "time": [_t(start_time), _t(end_time)] if start_time else None})
+            self.db.employees.cover_day(employee_id, parse_date(start))
         return cur.lastrowid
 
     def cancel(self, leave_id: int, reason: str) -> None:
@@ -1026,6 +1088,7 @@ class PunchesRepo(_Repo):
             self._log(pid, employee_id, "add", reason, new_ts=iso_dt(ts), new_kind=kind)
             self.db.audit("إضافة بصمة يدوية", "employee", employee_id,
                           {"punch": pid, "ts": iso_dt(ts), "reason": reason})
+            self.db.employees.cover_day(employee_id, ts.date())
         return pid
 
     def edit(self, punch_id: int, new_ts: datetime, new_kind: str, reason: str) -> None:
@@ -1046,6 +1109,7 @@ class PunchesRepo(_Repo):
                       row["kind"], new_kind)
             self.db.audit("تعديل بصمة", "employee", row["employee_id"],
                           {"punch": punch_id, "from": row["ts"], "to": iso_dt(new_ts), "reason": reason})
+            self.db.employees.cover_day(row["employee_id"], new_ts.date())
 
     def delete(self, punch_id: int, reason: str) -> None:
         reason = self._need_reason(reason)
@@ -1102,6 +1166,8 @@ EVENT_LABELS = {
     "camera": "مشكلة في الكاميرا",
     "backup": "النسخ الاحتياطي",
     "restore": "استرجاع نسخة",
+    "late_punch": "بصمة بعد انتهاء وقت الخروج",
+    "telegram": "إشعارات تلغرام",
 }
 
 
@@ -1187,3 +1253,36 @@ class TemplatesRepo(_Repo):
         with self.db.tx():
             self.db.x("DELETE FROM report_templates WHERE id = ?", (template_id,))
             self.db.audit("حذف تقرير مخصّص", "report", template_id)
+
+
+# ---------------------------------------------------------------------------
+class OutboxRepo(_Repo):
+    """Messages waiting for Telegram; kept until sent so nothing is lost while offline."""
+
+    def add(self, kind: str, text: str) -> int:
+        return self.db.x("INSERT INTO outbox (kind, text, created_at) VALUES (?,?,?)",
+                         (kind, text, self.db.now_s())).lastrowid
+
+    def pending(self, limit: int = 20):
+        """Unsent messages, oldest first (they are sent in order)."""
+        return self.db.q("SELECT * FROM outbox WHERE sent_at IS NULL AND dropped = 0 ORDER BY id LIMIT ?",
+                         (limit,))
+
+    def mark_sent(self, message_id: int) -> None:
+        self.db.x("UPDATE outbox SET sent_at = ?, last_error = '' WHERE id = ?", (self.db.now_s(), message_id))
+
+    def mark_failed(self, message_id: int, error: str) -> None:
+        self.db.x("UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?",
+                  (error, message_id))
+
+    def drop_older_than(self, cutoff: datetime) -> int:
+        """Give up on messages that could not be sent for days (they would arrive out of date)."""
+        return self.db.x("UPDATE outbox SET dropped = 1 WHERE sent_at IS NULL AND dropped = 0 AND"
+                         " created_at < ?", (iso_dt(cutoff),)).rowcount
+
+    def status(self) -> dict:
+        pending = self.db.scalar("SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL AND dropped = 0")
+        last_sent = self.db.scalar("SELECT MAX(sent_at) FROM outbox")
+        error = self.db.scalar("SELECT last_error FROM outbox WHERE sent_at IS NULL AND dropped = 0"
+                               " AND last_error <> '' ORDER BY id DESC LIMIT 1")
+        return {"pending": pending, "last_sent": last_sent, "error": error or ""}

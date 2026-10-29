@@ -255,3 +255,117 @@ def test_classify_new_punch(org):
     # Forgot to check in: an after-shift punch is a check-out.
     kind, _ = E.classify_new_punch(emp(), org, datetime(2026, 10, 25, 14, 5))
     assert kind == "out"
+
+
+# ---------------------------------------------------------------- strict rules
+# The department's rules: on time until 08:30, late until 09:00, absent after; exit from 14:45,
+# leaving earlier is an absence, a missing punch is an absence, exit punches until 17:00.
+def strict(**kw):
+    rules = dict(grace_late=30, absent_after=60, exit_until=T("17:00"), early_absent=True,
+                 missing_absent=True)
+    rules.update(kw)
+    return weekly(end="14:45", **rules)
+
+
+@pytest.fixture
+def strict_org():
+    return org_with(strict(), group_sched={1: [(1, date(2020, 1, 1))]})
+
+
+def day(*punches):
+    return emp([f"2026-10-25 {p}" for p in punches])
+
+
+def test_strict_on_time_late_and_absent_after_cutoff(strict_org):
+    r = one_day(day("08:29", "14:50"), strict_org, SUN)
+    assert (r.status, r.late) == (E.PRESENT, 0)
+    r = one_day(day("08:40", "14:50"), strict_org, SUN)
+    assert (r.status, r.late) == (E.PRESENT, 40)
+    r = one_day(day("09:00", "14:50"), strict_org, SUN)
+    assert (r.status, r.late) == (E.PRESENT, 60)  # 09:00 itself is still late, not absent
+    r = one_day(day("09:00:30", "14:50"), strict_org, SUN)
+    assert r.status == E.ABSENT and "absent_late" in r.flags and r.late == 0
+    assert r.label == "غائب (حضر بعد وقت الغياب)"
+    assert r.check_in == datetime(2026, 10, 25, 9, 0, 30)  # the punches stay visible
+
+
+def test_strict_exit_before_exit_time_is_absence_unless_on_leave(strict_org):
+    r = one_day(day("08:00", "14:30"), strict_org, SUN)
+    assert r.status == E.ABSENT and "absent_early" in r.flags and r.early == 0
+    assert r.label == "غائب (خرج قبل وقت الخروج)"
+    assert one_day(day("08:00", "14:45"), strict_org, SUN).status == E.PRESENT
+    hourly = E.LeaveType(3, "زمنية", unit="hour")
+    e = emp(["2026-10-25 08:00", "2026-10-25 13:00"],
+            leaves=[E.Leave(1, hourly, SUN, SUN, T("13:00"), T("14:45"))])
+    assert one_day(e, strict_org, SUN).status == E.PRESENT
+    # Leaving early then coming back: the last punch counts.
+    assert one_day(day("08:00", "11:00", "12:00", "14:50"), strict_org, SUN).status == E.PRESENT
+
+
+def test_strict_missing_exit_is_final_only_after_last_exit_time(strict_org):
+    e = day("08:05")
+    r = one_day(e, strict_org, SUN, now=datetime(2026, 10, 25, 16, 30))
+    assert r.status == E.PRESENT and "at_work" in r.flags
+    r = one_day(e, strict_org, SUN, now=datetime(2026, 10, 25, 17, 1))
+    assert r.status == E.ABSENT and "missing_out" in r.flags
+    assert r.label == "غائب (لم يسجّل انصرافاً)"
+    assert one_day(e, strict_org, SUN).status == E.ABSENT
+
+
+def test_strict_missing_check_in_is_absence(strict_org):
+    r = one_day(day("15:00"), strict_org, SUN)  # forgot to punch in, punched out only
+    assert r.check_out is not None and r.status == E.ABSENT and "missing_in" in r.flags
+
+
+def test_strict_no_show_becomes_absent_after_cutoff(strict_org):
+    e = emp()
+    r = one_day(e, strict_org, SUN, now=datetime(2026, 10, 25, 8, 45))
+    assert r.status == E.PENDING and "overdue" in r.flags
+    assert one_day(e, strict_org, SUN, now=datetime(2026, 10, 25, 9, 1)).status == E.ABSENT
+
+
+def test_strict_morning_hourly_leave_moves_the_cutoff(strict_org):
+    hourly = E.LeaveType(3, "زمنية", unit="hour")
+    lv = [E.Leave(1, hourly, SUN, SUN, T("08:00"), T("10:00"))]
+    r = one_day(emp(["2026-10-25 10:20", "2026-10-25 14:50"], leaves=lv), strict_org, SUN)
+    assert (r.status, r.late) == (E.PRESENT, 0)
+    r = one_day(emp(["2026-10-25 11:05", "2026-10-25 14:50"], leaves=lv), strict_org, SUN)
+    assert r.status == E.ABSENT and "absent_late" in r.flags
+
+
+def test_strict_custom_weekday_times():
+    s = strict()
+    days = list(s.days)
+    days[3] = E.DayRule(True, T("08:00"), T("13:00"))  # Thursday ends early
+    s.days = tuple(days)
+    org = org_with(s, group_sched={1: [(1, date(2020, 1, 1))]})
+    thu = date(2026, 10, 29)
+    ok = emp(["2026-10-29 08:10", "2026-10-29 13:05"])
+    assert one_day(ok, org, thu).status == E.PRESENT
+    early = emp(["2026-10-29 08:10", "2026-10-29 12:50"])
+    assert one_day(early, org, thu).status == E.ABSENT
+
+
+def test_strict_full_day_leave_wins(strict_org):
+    annual = E.LeaveType(1, "اعتيادية")
+    r = one_day(emp(leaves=[E.Leave(1, annual, SUN, SUN)]), strict_org, SUN)
+    assert r.status == E.LEAVE
+
+
+def test_exit_deadline_and_punch_window():
+    s = strict(window_after=60)
+    shift = s.shift_for(SUN)
+    assert s.exit_deadline(shift) == datetime(2026, 10, 25, 17, 0)
+    org = org_with(s, group_sched={1: [(1, date(2020, 1, 1))]})
+    r = one_day(day("08:00", "16:30"), org, SUN)  # outside window_after, inside the deadline
+    assert r.check_out == datetime(2026, 10, 25, 16, 30) and r.status == E.PRESENT
+    night = E.Schedule(2, "ليلي", "weekly", tuple(E.DayRule(True, T("20:00"), T("08:00")) for _ in range(7)),
+                       exit_until=T("10:00"))
+    assert night.exit_deadline(night.shift_for(SUN)) == datetime(2026, 10, 26, 10, 0)
+
+
+def test_rules_off_keep_the_old_behaviour(org):
+    r = one_day(emp(["2026-10-25 09:30", "2026-10-25 13:00"]), org, SUN)
+    assert r.status == E.PRESENT and r.late == 90 and r.early == 60
+    r = one_day(emp(["2026-10-25 08:00"]), org, SUN)
+    assert r.status == E.PRESENT and "missing_out" in r.flags

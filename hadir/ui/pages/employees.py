@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
-
 import cv2
 import numpy as np
 from openpyxl import Workbook, load_workbook
@@ -11,7 +9,7 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QPlainTextEdit, QProgressBar, QTabWidget, QVBoxLayout, QWidget)
+                               QProgressBar, QTabWidget, QVBoxLayout, QWidget)
 
 from ...core.settings import SECURITY_LEVELS
 from ...core.timeutil import digits, parse_date
@@ -26,8 +24,16 @@ from ..widgets.common import (Card, DataTable, DateEdit, PageHeader, SearchBox, 
 
 POSE_LABELS = {"front": "أمامي", "left": "يسار", "right": "يمين", "up": "للأعلى", "down": "للأسفل",
                "photo": "صورة", "auto": "تحديث تلقائي"}
-IMPORT_HEADERS = ["الرقم الوظيفي", "الاسم", "العنوان الوظيفي", "القسم", "المجموعة", "تاريخ المباشرة",
-                  "الهاتف"]
+IMPORT_HEADERS = ["الاسم", "رقم الهاتف", "الصفة الوظيفية", "المجموعة"]
+# Column names used by the import template of version 1.0.
+HEADER_ALIASES = {"الهاتف": "رقم الهاتف", "العنوان الوظيفي": "الصفة الوظيفية"}
+
+
+def cell_text(v) -> str:
+    """Excel cell -> text (whole numbers lose the trailing «.0» Excel gives them)."""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return "" if v is None else str(v).strip()
 
 
 class EmployeesPage(Page):
@@ -47,7 +53,7 @@ class EmployeesPage(Page):
 
         card = Card()
         tools = QHBoxLayout()
-        self.search = SearchBox("بحث بالاسم أو الرقم أو القسم…")
+        self.search = SearchBox("بحث بالاسم أو الرقم أو الصفة الوظيفية…")
         self.group = QComboBox()
         self.state = QComboBox()
         self.state.addItem("الفعّالون", True)
@@ -60,9 +66,9 @@ class EmployeesPage(Page):
         card.lay.addLayout(tools)
         self.table = DataTable([
             ("code", "الرقم الوظيفي", "text"), ("full_name", "الاسم", "text"),
-            ("job_title", "العنوان الوظيفي", "text"), ("department", "القسم", "text"),
+            ("job_title", "الصفة الوظيفية", "text"), ("phone", "رقم الهاتف", "text"),
             ("group_name", "المجموعة", "text"), ("face", "بصمة الوجه", "text"),
-            ("hire", "تاريخ المباشرة", "date"), ("state", "الحالة", "text")], stretch="full_name")
+            ("state", "الحالة", "text")], stretch="full_name")
         self.table.setMinimumHeight(420)
         self.table.activated_row.connect(lambda r: self.edit(r["id"]))
         card.lay.addWidget(self.table)
@@ -101,7 +107,6 @@ class EmployeesPage(Page):
             r = dict(e)
             n = e["samples"]
             r["face"] = f"{digits(n)} عينة" if n else "غير مسجّل"
-            r["hire"] = parse_date(e["hire_date"])
             r["state"] = "فعّال" if e["active"] else "غير فعّال"
             r["_tones"] = {"face": "warn" if not n else ("ok" if n >= 8 else "")}
             if not e["active"]:
@@ -165,9 +170,12 @@ class EmployeesPage(Page):
         ws.title = "الموظفون"
         ws.sheet_view.rightToLeft = True
         ws.append(IMPORT_HEADERS)
-        ws.append(["1001", "أحمد علي حسن", "مهندس", "الشؤون الفنية", "الموظفون", "2020/01/15", ""])
-        for col in "ABCDEFG":
-            ws.column_dimensions[col].width = 22
+        ws.append(["أحمد علي حسن", "07701234567", "محاسب", self.db.groups.names().get(
+            self.db.employees.default_group(), "")])
+        for col in "ABCD":
+            ws.column_dimensions[col].width = 26
+        for r in range(2, 502):
+            ws.cell(row=r, column=2).number_format = "@"  # keep the leading zero of phone numbers
         wb.save(path)
         info(self, "تم حفظ النموذج. املأه ثم استورده.")
 
@@ -184,51 +192,49 @@ class EmployeesPage(Page):
         if not rows:
             error(self, "الملف فارغ.")
             return
-        head = [str(c or "").strip() for c in rows[0]]
-        col = {h: head.index(h) for h in IMPORT_HEADERS if h in head}
-        if "الرقم الوظيفي" not in col or "الاسم" not in col:
-            error(self, "يجب أن يحتوي الصف الأول على عمودي «الرقم الوظيفي» و«الاسم» على الأقل.")
+        head = [HEADER_ALIASES.get(h, h) for h in (cell_text(c) for c in rows[0])]
+        col = {h: i for i, h in enumerate(head) if h}
+        if "الاسم" not in col:
+            error(self, "يجب أن يحتوي الصف الأول على عمود «الاسم» على الأقل.")
             return
         groups = {g["name"]: g["id"] for g in self.db.groups.list(include_inactive=True)}
-        default_group = next(iter(groups.values()), None)
+        default_group = self.db.employees.default_group()
+        by_name = {}
+        for e in self.db.employees.list(active=None):
+            by_name.setdefault(e["full_name"], e)
         created = updated = 0
         problems = []
         for n, row in enumerate(rows[1:], start=2):
             def get(h):
                 i = col.get(h)
-                v = row[i] if i is not None and i < len(row) else None
-                return v
-            code = str(get("الرقم الوظيفي") or "").strip()
-            name = str(get("الاسم") or "").strip()
-            if code.endswith(".0"):
-                code = code[:-2]
-            if not code and not name:
+                return cell_text(row[i]) if i is not None and i < len(row) else ""
+            name, code = get("الاسم"), get("الرقم الوظيفي")
+            if not name:
+                if code or any(cell_text(v) for v in row):
+                    problems.append(f"الصف {n}: لا يوجد اسم")
                 continue
-            hire = get("تاريخ المباشرة")
-            if isinstance(hire, datetime):
-                hire = hire.date()
-            elif isinstance(hire, str) and hire.strip():
-                try:
-                    hire = date.fromisoformat(hire.strip().replace("/", "-"))
-                except ValueError:
-                    problems.append(f"الصف {n}: تاريخ غير مفهوم «{hire}»")
-                    hire = None
-            gname = str(get("المجموعة") or "").strip()
-            gid = groups.get(gname, default_group)
+            # an existing employee is matched by employee number (old templates) or by full name
+            existing = self.db.employees.by_code(code) if code else by_name.get(name)
+            data = dict(full_name=name)
+            if code and not existing:
+                data["code"] = code
+            for h, key in (("رقم الهاتف", "phone"), ("الصفة الوظيفية", "job_title")):
+                if h in col:
+                    data[key] = get(h)
+            gname = get("المجموعة")
             if gname and gname not in groups:
-                problems.append(f"الصف {n}: المجموعة «{gname}» غير موجودة؛ وُضع في «المجموعة الافتراضية»")
-            existing = self.db.employees.by_code(code)
-            data = dict(code=code, full_name=name, job_title=str(get("العنوان الوظيفي") or ""),
-                        department=str(get("القسم") or ""), phone=str(get("الهاتف") or ""),
-                        hire_date=hire or (existing["hire_date"] if existing else None),
-                        active=True, group_id=gid)
+                problems.append(f"الصف {n}: المجموعة «{gname}» غير موجودة؛ وُضع في المجموعة الافتراضية")
+            if gname in groups:
+                data["group_id"] = groups[gname]
+            elif not existing and default_group:
+                data["group_id"] = default_group
             try:
-                self.db.employees.save(data, existing["id"] if existing else None,
-                                       group_effective=hire or "2000-01-01")
+                eid = self.db.employees.save(data, existing["id"] if existing else None)
                 if existing:
                     updated += 1
                 else:
                     created += 1
+                    by_name.setdefault(name, self.db.employees.get(eid))
             except StoreError as exc:
                 problems.append(f"الصف {n}: {exc}")
         self.refresh()
@@ -270,48 +276,38 @@ class EmployeeDialog(QDialog):
         w = QWidget()
         grid = QHBoxLayout(w)
         form = QFormLayout()
-        self.code = QLineEdit()
         self.name = QLineEdit()
-        self.job = QLineEdit()
-        self.dept = QLineEdit()
         self.phone = QLineEdit()
+        self.job = QLineEdit()
+        self.job.setPlaceholderText("مثل: محاسب، مسؤول الشعبة، موظف خدمة")
         self.group = QComboBox()
         self.group_from = DateEdit(self.db.now().date())
-        self.has_hire = QCheckBox("محدد")
-        self.hire = DateEdit()
-        self.has_end = QCheckBox("ترك الخدمة")
-        self.end = DateEdit()
         self.active = QCheckBox("فعّال (يمكنه التسجيل في جهاز الحضور)")
-        self.notes = QPlainTextEdit()
-        self.notes.setFixedHeight(70)
         self.pin = QLineEdit()
         self.pin.setEchoMode(QLineEdit.Password)
         self.pin.setPlaceholderText("اتركه فارغاً لعدم التغيير")
-        form.addRow("الرقم الوظيفي:", self.code)
+        self.code_hint = label("", "Hint")
         form.addRow("الاسم الكامل:", self.name)
-        form.addRow("العنوان الوظيفي:", self.job)
-        form.addRow("القسم/الشعبة:", self.dept)
-        form.addRow("الهاتف:", self.phone)
+        form.addRow("رقم الهاتف:", self.phone)
+        form.addRow("الصفة الوظيفية:", self.job)
+        # The group is asked only when there is a choice; otherwise everyone joins the default group.
+        self.show_group = len(self.db.groups.list(include_inactive=True)) > 1
         g = QHBoxLayout()
         g.addWidget(self.group, 1)
         self.group_from_lbl = label("اعتباراً من")
         g.addWidget(self.group_from_lbl)
         g.addWidget(self.group_from)
-        form.addRow("المجموعة:", g)
-        h = QHBoxLayout()
-        h.addWidget(self.has_hire)
-        h.addWidget(self.hire)
-        h.addStretch(1)
-        form.addRow("تاريخ المباشرة:", h)
-        e = QHBoxLayout()
-        e.addWidget(self.has_end)
-        e.addWidget(self.end)
-        e.addStretch(1)
-        form.addRow("ترك الخدمة:", e)
-        form.addRow("", self.active)
+        if self.show_group:
+            form.addRow("المجموعة:", g)
+        else:
+            self.group.hide()
+            self.group_from_lbl.hide()
+            self.group_from.hide()
+        if self.employee_id:
+            form.addRow("", self.active)
         if self.ctx.setting("kiosk.allow_pin"):
             form.addRow("رمز سري للتسجيل:", self.pin)
-        form.addRow("ملاحظات:", self.notes)
+            form.addRow("", self.code_hint)
         grid.addLayout(form, 1)
         side = QVBoxLayout()
         self.photo = QLabel(alignment=Qt.AlignCenter)
@@ -321,8 +317,6 @@ class EmployeeDialog(QDialog):
         side.addStretch(1)
         grid.addLayout(side)
         self.tabs.addTab(w, "البيانات")
-        self.has_hire.toggled.connect(self.hire.setEnabled)
-        self.has_end.toggled.connect(self.end.setEnabled)
 
     def _build_face(self):
         w = QWidget()
@@ -396,35 +390,21 @@ class EmployeeDialog(QDialog):
             self.sched_combo.addItem(s["name"], s["id"])
         e = self.db.employees.get(self.employee_id) if self.employee_id else None
         if e is None:
-            self.code.setText(self.db.employees.next_code())
             self.active.setChecked(True)
-            self.has_hire.setChecked(False)
-            self.hire.setEnabled(False)
-            self.end.setEnabled(False)
+            self.group.setCurrentIndex(max(0, self.group.findData(self.db.employees.default_group())))
             self.group_from_lbl.hide()
             self.group_from.hide()
             for i in (1, 2):
                 self.tabs.setTabEnabled(i, False)
             self.tabs.setTabToolTip(1, "احفظ بيانات الموظف أولاً")
             return
-        self.code.setText(e["code"])
         self.name.setText(e["full_name"])
-        self.job.setText(e["job_title"])
-        self.dept.setText(e["department"])
         self.phone.setText(e["phone"])
-        self.notes.setPlainText(e["notes"])
+        self.job.setText(e["job_title"])
         self.active.setChecked(bool(e["active"]))
+        self.code_hint.setText(f"الرقم الوظيفي للتسجيل بالرمز السري: {e['code']}")
         self._orig_group = e["group_id"]
         self.group.setCurrentIndex(max(0, self.group.findData(e["group_id"])))
-        hire, end = parse_date(e["hire_date"]), parse_date(e["end_date"])
-        self.has_hire.setChecked(hire is not None)
-        self.hire.setEnabled(hire is not None)
-        if hire:
-            self.hire.set_value(hire)
-        self.has_end.setChecked(end is not None)
-        self.end.setEnabled(end is not None)
-        if end:
-            self.end.set_value(end)
         self._load_photo()
         self._load_samples()
         self._load_schedule()
@@ -469,15 +449,14 @@ class EmployeeDialog(QDialog):
         self.group_hist.set_rows(hist)
 
     def save(self):
-        data = dict(code=self.code.text(), full_name=self.name.text(), job_title=self.job.text(),
-                    department=self.dept.text(), phone=self.phone.text(),
-                    notes=self.notes.toPlainText(), active=self.active.isChecked(),
-                    hire_date=self.hire.value() if self.has_hire.isChecked() else None,
-                    end_date=self.end.value() if self.has_end.isChecked() else None,
-                    group_id=self.group.currentData())
-        if data["end_date"] and data["end_date"] <= self.db.now().date():
-            data["active"] = False
-        effective = self.group_from.value() if self.employee_id else (data["hire_date"] or "2000-01-01")
+        data = dict(full_name=self.name.text(), phone=self.phone.text(), job_title=self.job.text())
+        if self.employee_id:
+            data["active"] = self.active.isChecked()
+        group = self.group.currentData() if self.show_group else (
+            None if self.employee_id else self.db.employees.default_group())
+        if group is not None:
+            data["group_id"] = group
+        effective = self.group_from.value() if self.employee_id else None
         try:
             new_id = self.db.employees.save(data, self.employee_id, group_effective=effective)
             if self.pin.text():

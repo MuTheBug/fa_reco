@@ -76,8 +76,48 @@ def test_schedule_dialog_round_trip(window):
     dlg = ScheduleDialog(db, sid, False, window)
     data = dlg._data()
     sunday = data["days"][6]
-    assert sunday[0] and sunday[1].strftime("%H:%M") == "08:00" and sunday[2].strftime("%H:%M") == "14:00"
+    assert sunday[0] and sunday[1].strftime("%H:%M") == "08:00" and sunday[2].strftime("%H:%M") == "14:45"
     assert not data["days"][4][0]  # Friday off
+    assert next(r for r in dlg.rows if r.index == 6).hint.text() == "لا تأخير حتى 08:30 • غياب بعد 09:00"
+    # the department's rules survive opening and saving the editor
+    assert (data["grace_late"], data["absent_after"], data["exit_until"].strftime("%H:%M")) == (30, 60, "17:00")
+    assert data["early_absent"] is True and data["missing_absent"] is True
+    dlg.save()
+    s = db.schedules.get(sid)
+    assert (s.grace_late, s.absent_after, s.early_absent, s.missing_absent) == (30, 60, True, True)
+
+
+def test_settings_show_the_rules_day_by_day(window, qapp):
+    window.start()
+    window.admin.show_page("settings")
+    view = window.admin.pages["settings"].rules_view
+    rows = {r["day"]: r for r in view.table.model_.rows}
+    assert len(rows) == 7 and rows["الجمعة"]["start"] == "عطلة"
+    sunday = rows["الأحد"]
+    assert (sunday["start"], sunday["on_time"], sunday["absent"], sunday["exit"], sunday["last"]) == (
+        "08:00", "08:30", "09:00", "14:45", "17:00")
+
+
+def test_new_employee_form_needs_only_name_phone_and_job(window, qapp, monkeypatch):
+    from PySide6.QtWidgets import QFormLayout
+
+    from hadir.ui.pages import employees
+
+    db = window.ctx.db
+    dlg = employees.EmployeeDialog(window.ctx, None, window)
+    form = dlg.tabs.widget(0).layout().itemAt(0).layout()
+    labels = [form.itemAt(i, QFormLayout.LabelRole) for i in range(form.rowCount())]
+    texts = [w.widget().text() for w in labels if w is not None and w.widget() is not None]
+    assert texts[:3] == ["الاسم الكامل:", "رقم الهاتف:", "الصفة الوظيفية:"]
+    assert not any(t in texts for t in ("العنوان الوظيفي:", "تاريخ المباشرة:", "ترك الخدمة:"))
+    dlg.name.setText("سجاد كاظم")
+    dlg.phone.setText("07801112233")
+    dlg.job.setText("مدقق")
+    monkeypatch.setattr(employees, "confirm", lambda *a, **k: False)  # no face enrollment now
+    dlg.save()
+    e = db.employees.get(dlg.employee_id)
+    assert (e["full_name"], e["phone"], e["job_title"]) == ("سجاد كاظم", "07801112233", "مدقق")
+    assert e["code"] and e["hire_date"] == db.now().date().isoformat() and e["group_id"]
 
 
 def test_report_builder_runs(window, qapp):
@@ -127,3 +167,25 @@ def test_tables_keep_given_order_until_header_click(qapp):
     assert first == "ب"
     t.sortByColumn(1, Qt.AscendingOrder)
     assert t.model().index(0, 0).data() == "أ"
+
+
+def test_telegram_settings_need_token_and_hide_it_from_the_audit_log(window, qapp, monkeypatch):
+    from hadir.ui.pages import settings
+
+    window.start()
+    window.admin.show_page("settings")
+    page = window.admin.pages["settings"]
+    errors = []
+    monkeypatch.setattr(settings, "error", lambda parent, text, title="": errors.append(text))
+    monkeypatch.setattr(settings, "info", lambda *a, **k: None)
+    page.w["telegram.enabled"].setChecked(True)
+    page.save()
+    assert errors and "رمز البوت" in errors[-1]
+    page.w["telegram.token"].setText("123:ABC")
+    page.w["telegram.chat_id"].setText("-100")
+    page.save()
+    db = window.ctx.db
+    assert db.settings.get("telegram.enabled") and db.settings.get("telegram.token") == "123:ABC"
+    logged = " ".join(r["details"] for r in db.q("SELECT details FROM audit_log"))
+    assert "telegram.token" in logged and "123:ABC" not in logged
+    assert "تلغرام" in page.about_lbl.text()

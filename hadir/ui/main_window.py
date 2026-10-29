@@ -12,6 +12,7 @@ from .. import APP_SUBTITLE, APP_TITLE
 from ..core import maintenance
 from ..face.service import purge_snapshots
 from ..kiosk_logic import KioskLogic
+from ..notify import telegram
 from ..paths import backups_dir, snapshots_dir
 from .admin import AdminShell
 from .dialogs import LoginDialog
@@ -23,11 +24,12 @@ from .widgets.common import Toast, error
 class AppContext:
     """Objects shared by every screen."""
 
-    def __init__(self, db, camera, worker: FaceWorker, window=None):
+    def __init__(self, db, camera, worker: FaceWorker, window=None, telegram=None):
         self.db = db
         self.camera = camera
         self.worker = worker
         self.window = window
+        self.telegram = telegram  # the Telegram sender thread (None when not running)
         self.logic = KioskLogic(db)
         self._settings = db.settings.all()
 
@@ -183,6 +185,13 @@ class MainWindow(QMainWindow):
         if db.settings.get("maintenance.last_purge") != today:
             purge_snapshots(snapshots_dir(), int(db.settings.get("kiosk.snapshot_days") or 0), db.now())
             db.settings.set("maintenance.last_purge", today, audit=False)
+        try:
+            if telegram.daily_list_due(db, db.now()):
+                db.settings.set("telegram.last_list", today, audit=False)
+                if telegram.queue_daily_list(db, db.now().date()) and self.ctx.telegram:
+                    self.ctx.telegram.wake()
+        except Exception as exc:  # the attendance screen must keep working whatever happens here
+            db.events.add("telegram", f"تعذّر إعداد قائمة الحضور اليومية: {exc}")
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):

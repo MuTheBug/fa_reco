@@ -18,7 +18,7 @@ from ..widgets.common import (Card, CheckList, DataTable, DateEdit, EmployeeComb
 
 
 class ScopeBox(QWidget):
-    """Groups / employee / department filters shared by both report tabs."""
+    """Groups / employee filters shared by both report tabs."""
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -28,12 +28,9 @@ class ScopeBox(QWidget):
         self.groups = CheckList()
         self.groups.setMaximumHeight(110)
         self.emp = EmployeeCombo(db, allow_all=True)
-        self.dept = QLineEdit()
-        self.dept.setPlaceholderText("اختياري")
         self.inactive = QCheckBox("تضمين غير الفعّالين")
         form.addRow("المجموعات (بدون تحديد = الكل):", self.groups)
         form.addRow("الموظف:", self.emp)
-        form.addRow("القسم يحتوي:", self.dept)
         form.addRow("", self.inactive)
 
     def reload(self):
@@ -45,13 +42,12 @@ class ScopeBox(QWidget):
     def params(self) -> dict:
         emp = self.emp.current_id()
         return {"group_ids": self.groups.checked() or None, "employee_ids": [emp] if emp else None,
-                "department": self.dept.text().strip(), "include_inactive": self.inactive.isChecked()}
+                "include_inactive": self.inactive.isChecked()}
 
     def set_params(self, d: dict):
         self.groups.set_checked(d.get("group_ids") or [])
         emps = d.get("employee_ids") or []
         self.emp.set_id(emps[0] if emps else None)
-        self.dept.setText(d.get("department", ""))
         self.inactive.setChecked(bool(d.get("include_inactive")))
 
 
@@ -359,7 +355,7 @@ class ReportBuilder(QWidget):
             "punches": ["date", "time", "code", "name", "source", "score"],
             "leaves": ["code", "name", "type", "start", "end", "days", "reference"],
             "corrections": ["created_at", "username", "name", "action", "old_ts", "new_ts", "reason"],
-            "employees": ["code", "name", "job_title", "department", "group", "samples"],
+            "employees": ["code", "name", "job_title", "phone", "group", "samples"],
         }[src]
         self._fill_columns([{"key": k} for k in defaults])
         fields = self._fields()

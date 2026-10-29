@@ -74,6 +74,7 @@ def run_gui(args) -> int:
     from .core.timeutil import Fmt
     from .db.store import Database
     from .face.camera import CameraSource
+    from .notify.telegram import Sender
     from .paths import data_dir, db_path
     from .ui.dialogs import FirstRunDialog
     from .ui.face_worker import FaceWorker
@@ -112,13 +113,16 @@ def run_gui(args) -> int:
     camera.start()
     worker = FaceWorker(db, camera, s)
     worker.start()
-    ctx = AppContext(db, camera, worker)
+    sender = Sender(db)  # idle unless Telegram notifications are switched on
+    sender.start()
+    ctx = AppContext(db, camera, worker, telegram=sender)
     win = MainWindow(ctx, kiosk_first=bool(s["kiosk.start_in_kiosk"]) and not args.admin)
     win.start()
     if args.admin:
         win.in_kiosk = True
         win.request_admin()
     code = app.exec()
+    sender.stop()
     lock.unlock()
     return code
 
@@ -156,6 +160,10 @@ def selftest(args) -> int:
     blank = np.full((720, 1280, 3), 128, np.uint8)
     a = engine.analyze(blank)
     out.append(f"engine ok, faces on blank frame: {len(a.faces)}")
+    import ssl  # Telegram notifications need HTTPS with the system certificates
+
+    ssl.create_default_context()
+    out.append(f"ssl ok: {ssl.OPENSSL_VERSION}")
     if args.selftest_image:
         img = cv2.imread(args.selftest_image)
         a = engine.analyze(img, embed=True)

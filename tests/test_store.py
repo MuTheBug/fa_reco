@@ -1,10 +1,11 @@
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import numpy as np
 import pytest
 
 from hadir.core import engine as E
+from hadir.db.schema import MIGRATIONS
 from hadir.db.seed import seed_defaults
 from hadir.db.store import Database, StoreError
 
@@ -34,12 +35,15 @@ def add_emp(db, code="1001", name="أحمد علي", group=None):
 
 
 def test_seed_and_schema(db):
-    assert db.schema_version == 1
+    assert db.schema_version == len(MIGRATIONS)
     assert len(db.leaves.types()) == 6
     sched = db.schedules.all_engine()
     [s] = sched.values()
-    assert s.shift_for(date(2026, 10, 25)) is not None  # Sunday
+    shift = s.shift_for(date(2026, 10, 25))  # Sunday
+    assert (shift.start.time(), shift.end.time()) == (time(8, 0), time(14, 45))
     assert s.shift_for(date(2026, 10, 30)) is None  # Friday
+    assert (s.grace_late, s.absent_after, s.exit_until) == (30, 60, time(17, 0))
+    assert s.early_absent and s.missing_absent
     seed_defaults(db)  # idempotent
     assert len(db.schedules.list()) == 1
 
@@ -83,7 +87,7 @@ def test_punch_corrections_need_reason_and_are_append_only(db):
     with pytest.raises(StoreError):
         db.punches.edit(pid, datetime(2026, 10, 25, 8, 0), "auto", "")
     db.punches.edit(pid, datetime(2026, 10, 25, 8, 0), "auto", "عطل في الكاميرا صباحاً")
-    db.punches.add_manual(eid, datetime(2026, 10, 25, 14, 0), "out", "نسي تسجيل الانصراف - بموافقة المدير")
+    db.punches.add_manual(eid, datetime(2026, 10, 25, 14, 50), "out", "نسي تسجيل الانصراف - بموافقة المدير")
     with pytest.raises(StoreError):
         db.punches.add_manual(eid, datetime(2026, 11, 25, 14, 0), "out", "سبب")  # future
     corr = db.punches.corrections(employee_id=eid)
@@ -99,7 +103,7 @@ def test_punch_corrections_need_reason_and_are_append_only(db):
     assert db.punches.get(pid)["original_ts"] == "2026-10-25 08:20:00"
     [(e, days)] = db.compute([eid], date(2026, 10, 25), date(2026, 10, 25))
     r = days[0]
-    assert r.status == E.PRESENT and r.late == 0 and r.check_out == datetime(2026, 10, 25, 14)
+    assert r.status == E.PRESENT and r.late == 0 and r.check_out == datetime(2026, 10, 25, 14, 50)
     assert {"corrected", "manual"} <= r.flags
     db.punches.delete(pid, "بصمة مكررة")
     [(e, days)] = db.compute([eid], date(2026, 10, 25), date(2026, 10, 25))
@@ -139,11 +143,11 @@ def test_holidays_and_schedule_assignment(db):
     db.groups.assign_schedule(gid, late, "2026-10-26", "2026-10-27")
     db.punches.add_face(eid, datetime(2026, 10, 26, 9, 5))
     db.punches.add_face(eid, datetime(2026, 10, 26, 13, 0))
-    db.punches.add_face(eid, datetime(2026, 10, 28, 9, 5))
+    db.punches.add_face(eid, datetime(2026, 10, 28, 8, 45))
     [(e, days)] = db.compute([eid], date(2026, 10, 25), date(2026, 10, 28))
     assert [d.status for d in days] == [E.HOLIDAY, E.PRESENT, E.ABSENT, E.PRESENT]
     assert days[1].late == 0 and days[1].schedule.name == "رمضان"
-    assert days[3].late == 65 and days[3].schedule.name == "الدوام الرسمي"
+    assert days[3].late == 45 and days[3].schedule.name == "الدوام الرسمي"
     with pytest.raises(StoreError):
         db.schedules.delete(late)
 
@@ -198,3 +202,109 @@ def test_backup(db, tmp_path):
 def test_invalid_day_start_falls_back(db):
     db.settings.set("attendance.day_start", "99:99")
     assert db.load_org().day_start.hour == 4
+
+
+# ------------------------------------------------------------ upgrade from 1.0
+def make_v1_db(path, grace_late=10, punches=("2026-10-27 08:05:00", "2026-10-27 14:02:00")):
+    """A database as version 1.0 left it after its first run."""
+    from hadir.db.store import _split_sql
+
+    created = "2026-10-27 07:30:00"
+    conn = sqlite3.connect(path)
+    for stmt in _split_sql(MIGRATIONS[0]):
+        conn.execute(stmt)
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute("INSERT INTO schedules (name, kind, grace_late, created_at) VALUES (?, 'weekly', ?, ?)",
+                 ("الدوام الرسمي", grace_late, created))
+    for i in range(7):
+        work = i not in (4, 5)
+        conn.execute("INSERT INTO schedule_days VALUES (1, ?, ?, ?, ?)",
+                     (i, int(work), "08:00" if work else None, "14:00" if work else None))
+    conn.execute("INSERT INTO emp_groups (name, created_at) VALUES ('الموظفون', ?)", (created,))
+    conn.execute("INSERT INTO schedule_assignments (schedule_id, group_id, start_date, created_at)"
+                 " VALUES (1, 1, '2000-01-01', ?)", (created,))
+    conn.execute("INSERT INTO employees (code, full_name, created_at, updated_at) VALUES ('1001', 'أحمد', ?, ?)",
+                 (created, created))
+    conn.execute("INSERT INTO employee_groups (employee_id, group_id, start_date) VALUES (1, 1, '2000-01-01')")
+    for ts in punches:
+        conn.execute("INSERT INTO punches (employee_id, ts, original_ts, created_at) VALUES (1, ?, ?, ?)",
+                     (ts, ts, ts))
+    conn.commit()
+    conn.close()
+
+
+def test_upgrade_applies_new_rules_from_upgrade_day(tmp_path):
+    make_v1_db(tmp_path / "v1.db")
+    db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
+    assert db.schema_version == len(MIGRATIONS)
+    rows = {r["name"]: r for r in db.schedules.list()}
+    assert set(rows) == {"الدوام الرسمي", "الدوام الرسمي (حتى 2026/10/27)"}
+    assert not rows["الدوام الرسمي (حتى 2026/10/27)"]["active"]
+    new = db.schedules.get(rows["الدوام الرسمي"]["id"])
+    assert (new.grace_late, new.absent_after, new.exit_until) == (30, 60, time(17, 0))
+    assert new.shift_for(date(2026, 10, 28)).end.time() == time(14, 45)
+    assert db.employees.get(1)["hire_date"] == "2026-10-27"  # filled in from the day he was added
+    db.punches.add_face(1, datetime(2026, 10, 28, 8, 40))
+    [(e, days)] = db.compute([1], date(2026, 10, 27), date(2026, 10, 28))
+    # Yesterday keeps the old rules (14:02 was after the old 14:00 end); today uses the new ones.
+    assert days[0].status == E.PRESENT and days[0].schedule.name.startswith("الدوام الرسمي (حتى")
+    assert days[1].status == E.PRESENT and days[1].late == 40 and days[1].schedule.name == "الدوام الرسمي"
+    assert db.scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'تطبيق قواعد الدوام الجديدة'") == 1
+
+
+def test_upgrade_without_history_updates_in_place(tmp_path):
+    make_v1_db(tmp_path / "v1.db", punches=())
+    db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
+    [row] = db.schedules.list()
+    assert row["name"] == "الدوام الرسمي" and row["absent_after"] == 60 and row["exit_until"] == "17:00"
+
+
+def test_upgrade_leaves_a_changed_schedule_alone(tmp_path):
+    make_v1_db(tmp_path / "v1.db", grace_late=15)
+    db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
+    [row] = db.schedules.list()
+    assert (row["grace_late"], row["absent_after"], row["exit_until"]) == (15, 0, None)
+
+
+# ------------------------------------------------------------ employees and rules
+def test_employee_needs_only_name_and_gets_automatic_number_and_dates(db):
+    eid = db.employees.save(dict(full_name="زينب حسن", phone="07701234567", job_title="محاسبة"))
+    e = db.employees.get(eid)
+    assert e["code"] == "1001" and e["hire_date"] == "2026-10-28" and e["active"]
+    db.employees.save(dict(phone="07800000000"), eid)  # other fields are kept
+    e = db.employees.get(eid)
+    assert (e["phone"], e["job_title"], e["full_name"]) == ("07800000000", "محاسبة", "زينب حسن")
+    with pytest.raises(StoreError):
+        db.employees.save(dict(full_name="  "))
+
+
+def test_switching_active_off_ends_service_on_last_day_worked(db):
+    eid = add_emp(db)
+    db.employees.save(dict(active=False), eid)
+    assert db.employees.get(eid)["end_date"] == "2026-10-27"  # no punch today
+    db.employees.save(dict(active=True), eid)
+    assert db.employees.get(eid)["end_date"] is None
+    db.punches.add_face(eid, datetime(2026, 10, 28, 8, 0))
+    db.employees.save(dict(active=False), eid)
+    assert db.employees.get(eid)["end_date"] == "2026-10-28"
+
+
+def test_records_before_the_first_day_move_it_back(db):
+    eid = db.employees.save(dict(full_name="علي"))
+    db.punches.add_manual(eid, datetime(2026, 10, 20, 8, 0), "in", "حضر قبل تسجيله في النظام")
+    assert db.employees.get(eid)["hire_date"] == "2026-10-20"
+    annual = db.scalar("SELECT id FROM leave_types WHERE unit = 'day' ORDER BY id")
+    db.leaves.add(eid, annual, "2026-10-12", "2026-10-13")
+    assert db.employees.get(eid)["hire_date"] == "2026-10-12"
+
+
+def test_schedule_rules_roundtrip_and_validation(db):
+    days = [(True, "08:00", "14:45")] * 4 + [(False, None, None)] * 2 + [(True, "08:00", "14:45")]
+    sid = db.schedules.save(dict(name="صارم", days=days, grace_late=30, absent_after=60,
+                                 exit_until="17:00", early_absent=True, missing_absent=True))
+    s = db.schedules.get(sid)
+    assert (s.absent_after, s.exit_until, s.early_absent, s.missing_absent) == (60, time(17, 0), True, True)
+    with pytest.raises(StoreError):  # absence cutoff inside the on-time grace
+        db.schedules.save(dict(name="خطأ ١", days=days, grace_late=30, absent_after=20))
+    with pytest.raises(StoreError):  # last exit punch before the exit time
+        db.schedules.save(dict(name="خطأ ٢", days=days, exit_until="14:00"))

@@ -49,7 +49,17 @@ DEFAULTS: dict = {
     "reports.signatures": ["منظّم الكشف", "مسؤول الموارد البشرية", "المدير"],
     # Integrity
     "security.clock_check": True,
+    # Telegram notifications (optional; the only feature that uses the internet)
+    "telegram.enabled": False,
+    "telegram.token": "",
+    "telegram.chat_id": "",
+    "telegram.punches": True,  # a message for every check-in and check-out
+    "telegram.daily_list": True,  # the day's attendance list by name
+    "telegram.daily_time": "17:05",
 }
+
+# Values never written to the audit log.
+SECRET_KEYS = {"telegram.token"}
 
 SECURITY_LEVELS = {
     # primary (ArcFace) threshold, margin to the runner-up, frames, SFace-only threshold

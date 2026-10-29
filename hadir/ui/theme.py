@@ -201,6 +201,7 @@ ICONS = {
     "up": '<path d="M12 19V5"/><path d="M6 11l6-6 6 6"/>',
     "down": '<path d="M12 5v14"/><path d="M6 13l6 6 6-6"/>',
     "image": '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/>',
+    "send": '<path d="M21 3L3 10.5l7.5 3L13.5 21z"/><path d="M21 3L10.5 13.5"/>',
 }
 
 
