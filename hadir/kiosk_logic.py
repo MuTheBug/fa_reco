@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .core import engine as E
-from .core.timeutil import digits, fmt_minutes, fmt_time, parse_dt
+from .core.timeutil import digits, fmt_date, fmt_minutes, fmt_time, parse_dt, weekday_name
 from .db.store import Database
 from .face.pipeline import Decision, FaceEngine
 from .face.service import maybe_adapt, save_snapshot
@@ -36,6 +36,13 @@ def _minutes_text(m: int) -> str:
     return f"{fmt_minutes(m)} ساعة"
 
 
+def duty_block(rec: E.DayRecord) -> E.Block | None:
+    """The continuous duty (such as a week on guard) the day belongs to, if any."""
+    if rec.schedule is None or rec.shift is None:
+        return None
+    return rec.schedule.block_for(rec.date)
+
+
 def describe_day(rec: E.DayRecord, punch_type: str, ts: datetime) -> list[str]:
     """Short Arabic feedback about the punch just made."""
     lines = []
@@ -45,6 +52,22 @@ def describe_day(rec: E.DayRecord, punch_type: str, ts: datetime) -> list[str]:
         lines.append("اليوم عطلة أسبوعية في جدولك")
     elif rec.status == E.LEAVE:
         lines.append(f"لديك {rec.leave.type.name} اليوم" if rec.leave else "لديك إجازة اليوم")
+    elif duty_block(rec) is not None:
+        block = duty_block(rec)
+        end = f"{weekday_name(block.end.date())} {fmt_date(block.end.date())} الساعة {fmt_time(block.end)}"
+        absent = rec.status == E.ABSENT
+        if punch_type == "in":
+            if absent and "absent_late" in rec.flags:
+                lines.append("التحاق بعد وقت الغياب — يُحتسب يوم الالتحاق غياباً")
+            elif rec.late:
+                lines.append(f"التحاق متأخر {_minutes_text(rec.late)}")
+            else:
+                lines.append("التحاق في الموعد — نوبة موفقة")
+            lines.append(f"تنتهي نوبتك {end}")
+        elif absent and "absent_early" in rec.flags:
+            lines.append(f"خروج قبل نهاية النوبة ({end}) — تُحتسب الأيام المتبقية غياباً")
+        else:
+            lines.append(f"انتهت نوبتك ({digits(block.length)} أيام) — شكراً لك")
     elif rec.shift is not None:
         absent = rec.status == E.ABSENT
         if punch_type == "in":
@@ -54,7 +77,8 @@ def describe_day(rec: E.DayRecord, punch_type: str, ts: datetime) -> list[str]:
                 lines.append(f"متأخر {_minutes_text(rec.late)}")
             else:
                 lines.append("في الموعد — يوم موفق")
-            lines.append(f"دوامك من {fmt_time(rec.shift.start)} إلى {fmt_time(rec.shift.end)}")
+            tomorrow = " من اليوم التالي" if rec.shift.end.date() > rec.shift.start.date() else ""
+            lines.append(f"دوامك من {fmt_time(rec.shift.start)} إلى {fmt_time(rec.shift.end)}{tomorrow}")
         else:
             if absent and "absent_early" in rec.flags:
                 lines.append(f"خروج قبل الساعة {fmt_time(rec.shift.end)} — يُحتسب غياباً ما لم تكن لديك إجازة")
@@ -127,6 +151,8 @@ class KioskLogic:
             pid = self.db.punches.add_face(employee_id, ts, None, None, snap, source=source)
         telegram.queue_punch(self.db, emp, punch_type, rec, ts)
         title = "تم تسجيل الحضور" if punch_type == "in" else "تم تسجيل الانصراف"
+        if duty_block(rec) is not None:
+            title = "تم تسجيل الالتحاق بالنوبة" if punch_type == "in" else "تم تسجيل انتهاء النوبة"
         # The punch is recorded either way; an absence under the rules is shown as a warning.
         tone = "warn" if rec.status == E.ABSENT else "ok"
         return KioskResult("punched", tone, title, describe_day(rec, punch_type, ts), employee_id,

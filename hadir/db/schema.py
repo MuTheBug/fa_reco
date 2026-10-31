@@ -70,6 +70,61 @@ def upgrade_seed_schedule(conn, now: datetime) -> None:
                  (stamp, new, f"اعتباراً من {today.isoformat()}"))
 
 
+# The department's three groups (version 1.2).  Guards take 24-hour turns from 08:00 with two days
+# off; weekly guards serve seven days in a row from 08:00 (one punch on joining, one at the end)
+# and then rest seven days.  Each guard can have his own first duty day (cycle_start).
+ADMIN_GROUP = "الموظفون الإداريون"
+GUARD_RULES = dict(grace_late=30, absent_after=60, exit_until="10:00", early_absent=1, missing_absent=1)
+GUARD_DAYS = [(1, "08:00", "08:00"), (0, None, None), (0, None, None)]
+ROTATION_DAYS = [(1, "08:00", "08:00")] * 7 + [(0, None, None)] * 7
+DEFAULT_GROUPS = [
+    # group, description, schedule, days, continuous
+    ("الحرس", "حراسة بنظام ٢٤ ساعة واجب و٤٨ ساعة استراحة", "دوام الحرس", GUARD_DAYS, 0),
+    ("حرس النوبات الأسبوعية", "نوبة أسبوعية متصلة: بصمة عند الالتحاق وبصمة عند انتهاء النوبة",
+     "النوبة الأسبوعية", ROTATION_DAYS, 1),
+]
+
+
+def rotation_anchor(today) -> str:
+    """The Sunday that starts the current week (weekly duties begin on Sundays)."""
+    return (today - timedelta(days=(today.weekday() + 1) % 7)).isoformat()
+
+
+def add_guard_groups(conn, now: datetime) -> None:
+    """Version 1.2: administrative staff, guards and weekly guards as separate groups.
+
+    A new database is left to the first-run setup, which creates the same groups.
+    """
+    if not conn.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]:
+        return
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    old = conn.execute("SELECT id FROM emp_groups WHERE name = 'الموظفون'").fetchone()
+    if old and not conn.execute("SELECT 1 FROM emp_groups WHERE name = ?", (ADMIN_GROUP,)).fetchone():
+        conn.execute("UPDATE emp_groups SET name = ? WHERE id = ?", (ADMIN_GROUP, old["id"]))
+    for group, description, schedule, days, continuous in DEFAULT_GROUPS:
+        if conn.execute("SELECT 1 FROM emp_groups WHERE name = ?", (group,)).fetchone():
+            continue
+        row = conn.execute("SELECT id FROM schedules WHERE name = ?", (schedule,)).fetchone()
+        if row:
+            sid = row["id"]
+        else:
+            anchor = rotation_anchor(now.date()) if continuous else now.date().isoformat()
+            sid = conn.execute(
+                "INSERT INTO schedules (name, kind, cycle_anchor, continuous, created_at"
+                f"{''.join(', ' + k for k in GUARD_RULES)}) VALUES (?, 'cycle', ?, ?, ?"
+                f"{', ?' * len(GUARD_RULES)})",
+                (schedule, anchor, continuous, stamp, *GUARD_RULES.values())).lastrowid
+            for i, (work, start, end) in enumerate(days):
+                conn.execute("INSERT INTO schedule_days (schedule_id, day_index, workday, start_time,"
+                             " end_time) VALUES (?,?,?,?,?)", (sid, i, work, start, end))
+        gid = conn.execute("INSERT INTO emp_groups (name, description, created_at) VALUES (?,?,?)",
+                           (group, description, stamp)).lastrowid
+        conn.execute("INSERT INTO schedule_assignments (schedule_id, group_id, start_date, created_at)"
+                     " VALUES (?, ?, '2000-01-01', ?)", (sid, gid, stamp))
+        conn.execute("INSERT INTO audit_log (ts, username, action, entity, entity_id, details)"
+                     " VALUES (?, 'النظام', 'إضافة مجموعة', 'group', ?, ?)", (stamp, gid, group))
+
+
 MIGRATIONS: list = [
     # 1 -- initial schema
     """
@@ -332,5 +387,13 @@ MIGRATIONS: list = [
         WHERE hire_date IS NULL;
         """,
         upgrade_seed_schedule,
+    ],
+    # 3 -- guard groups: own rotation start per employee, continuous duties
+    [
+        """
+        ALTER TABLE schedules ADD COLUMN continuous INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE employees ADD COLUMN cycle_start TEXT;
+        """,
+        add_guard_groups,
     ],
 ]

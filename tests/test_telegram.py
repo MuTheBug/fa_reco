@@ -3,7 +3,7 @@
 import io
 import json
 import urllib.error
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import pytest
 
@@ -75,40 +75,89 @@ def test_nothing_is_queued_while_switched_off(db):
     assert db.scalar("SELECT COUNT(*) FROM outbox") == 0
 
 
-def test_daily_list_by_name_with_status_and_summary(db):
+def test_attendance_report_lists_who_came_and_who_did_not_by_group(db):
     a, b, c = add(db, "باسم"), add(db, "أحمد", "مهندس"), add(db, "زينب")
-    db.punches.add_face(a, datetime(2026, 10, 25, 8, 0))
-    db.punches.add_face(a, datetime(2026, 10, 25, 14, 50))
-    db.punches.add_face(b, datetime(2026, 10, 25, 8, 40))
-    db.punches.add_face(b, datetime(2026, 10, 25, 14, 46))
+    late = add(db, "علي", "كاتب")
+    guards = db.scalar("SELECT id FROM emp_groups WHERE name = 'الحرس'")
+    on_duty = db.employees.save(dict(full_name="حارس أول", job_title="حارس", group_id=guards,
+                                     hire_date="2026-01-01", cycle_start="2026-10-25"))
+    db.employees.save(dict(full_name="حارس ثانٍ", job_title="حارس", group_id=guards, hire_date="2026-01-01",
+                           cycle_start="2026-10-26"))
+    for eid, times in ((a, ("08:00", "14:50")), (b, ("08:40", "14:46")), (late, ("09:20", "14:50")),
+                       (on_duty, ("08:00",))):
+        for t in times:
+            db.punches.add_face(eid, datetime.fromisoformat(f"2026-10-25 {t}"))
     switch_on(db)
     db.clock.now = datetime(2026, 10, 25, 17, 5)
-    [text] = T.daily_list(db, date(2026, 10, 25))
-    lines = text.splitlines()
-    assert lines[0] == "📋 قائمة الحضور — الأحد 2026/10/25" and lines[1] == "دائرة الاختبار"
-    assert lines[3] == "1. أحمد — مهندس — دخول 08:40 — خروج 14:46 — متأخر 40 دقيقة"
-    assert lines[4] == "2. باسم — محاسب — دخول 08:00 — خروج 14:50 — حاضر"
-    assert lines[5] == "3. زينب — محاسب — غائب"
-    assert lines[-1] == "الحاضرون: 2 • المتأخرون: 1 • الغائبون: 1 • المجازون: 0"
-    assert T.daily_list(db, date(2026, 10, 30)) == []  # Friday: nobody works
+    [text] = T.attendance_report(db, date(2026, 10, 25), time(17, 5))
+    assert text.splitlines() == [
+        "📋 تقرير الحضور — الأحد 2026/10/25 — الساعة 17:05",
+        "دائرة الاختبار",
+        "",
+        "👥 الموظفون الإداريون — حضر 2 من 4",
+        "✅ حضروا وسجّلوا البصمة (2):",
+        "1. أحمد (مهندس) — دخول 08:40 — خروج 14:46 — متأخر 40 دقيقة",
+        "2. باسم (محاسب) — دخول 08:00 — خروج 14:50",
+        "❌ لم يحضروا أو لم يسجّلوا البصمة (2):",
+        "1. زينب (محاسب)",
+        "2. علي (كاتب) — حضر 09:20 بعد وقت الغياب",
+        "",
+        "👥 الحرس — حضر 1 من 1",
+        "✅ حضروا وسجّلوا البصمة (1):",
+        "1. حارس أول (حارس) — دخول 08:00",
+        "🏖 إجازة أو عطلة أو استراحة (1):",
+        "1. حارس ثانٍ (حارس) — استراحة",
+        "",
+        "المجموع: حضر 3 • لم يحضر 2 • لم يصل بعد 0 • إجازة أو عطلة أو استراحة 1",
+    ]
+    assert T.attendance_report(db, date(2026, 10, 30)) == []  # Friday: everybody is off
     assert c
 
 
-def test_long_lists_are_split(db, monkeypatch):
+def test_long_reports_are_split(db, monkeypatch):
     for i in range(30):
         add(db, f"موظف رقم {i:02d} باسم طويل نوعاً ما")
     monkeypatch.setattr(T, "MAX_TEXT", 600)
-    messages = T.daily_list(db, date(2026, 10, 25))
+    messages = T.attendance_report(db, date(2026, 10, 25))
     assert len(messages) > 1 and all(len(m) <= 600 for m in messages)
     assert sum(m.count("موظف رقم") for m in messages) == 30
 
 
-def test_daily_list_is_due_once_after_its_time(db):
+def test_reports_are_due_once_after_each_time(db):
+    switch_on(db)  # by default at 09:05 and 17:05
+    assert T.report_due(db, datetime(2026, 10, 25, 9, 0)) is None
+    assert T.report_due(db, datetime(2026, 10, 25, 9, 6)) == time(9, 5)
+    db.settings.set("telegram.last_list", "2026-10-25 09:05", audit=False)
+    assert T.report_due(db, datetime(2026, 10, 25, 12, 0)) is None
+    assert T.report_due(db, datetime(2026, 10, 25, 17, 6)) == time(17, 5)
+    db.settings.set("telegram.last_list", "2026-10-25 17:05", audit=False)
+    assert T.report_due(db, datetime(2026, 10, 25, 23, 0)) is None
+    assert T.report_due(db, datetime(2026, 10, 26, 9, 10)) == time(9, 5)
+    assert T.parse_times("17:05، 9:05 09:05") == [time(9, 5), time(17, 5)]
+    with pytest.raises(ValueError):
+        T.parse_times("25:00")
+
+
+def test_weekly_guard_joins_and_ends_the_duty(db):
+    from hadir.core import engine as E
+
     switch_on(db)
-    assert not T.daily_list_due(db, datetime(2026, 10, 25, 16, 0))
-    assert T.daily_list_due(db, datetime(2026, 10, 25, 17, 6))
-    db.settings.set("telegram.last_list", "2026-10-25", audit=False)
-    assert not T.daily_list_due(db, datetime(2026, 10, 25, 18, 0))
+    weekly = db.scalar("SELECT id FROM emp_groups WHERE name = 'حرس النوبات الأسبوعية'")
+    eid = db.employees.save(dict(full_name="حارس النوبة", job_title="حارس", group_id=weekly,
+                                 hire_date="2026-01-01", cycle_start="2026-10-25"))
+    logic = KioskLogic(db)
+    db.clock.now = datetime(2026, 10, 25, 7, 58)
+    res = logic.register(eid, datetime(2026, 10, 25, 7, 58))
+    assert res.title == "تم تسجيل الالتحاق بالنوبة" and "تنتهي نوبتك الأحد 2026/11/01 الساعة 08:00" in res.lines
+    db.clock.now = datetime(2026, 11, 1, 8, 4)
+    res = logic.register(eid, datetime(2026, 11, 1, 8, 4))
+    assert res.title == "تم تسجيل انتهاء النوبة" and res.tone == "ok"
+    first, second = [r["text"] for r in db.q("SELECT text FROM outbox ORDER BY id")]
+    assert first.startswith("🟢 التحاق بالنوبة")
+    assert "النوبة: من الأحد 2026/10/25 08:00 إلى الأحد 2026/11/01 08:00" in first
+    assert second.startswith("🔴 انتهاء النوبة") and "وقت الخروج: 08:04" in second
+    [(emp, days)] = db.compute([eid], date(2026, 10, 25), date(2026, 11, 1))
+    assert [d.status for d in days] == [E.PRESENT] * 7 + [E.REST]
 
 
 # ---------------------------------------------------------------- sender

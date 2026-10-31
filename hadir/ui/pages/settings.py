@@ -254,11 +254,11 @@ class SettingsPage(Page):
         W["telegram.punches"] = QCheckBox("رسالة عند كل تسجيل حضور أو انصراف")
         W["telegram.punches"].setChecked(bool(s["telegram.punches"]))
         f.addRow("", W["telegram.punches"])
-        W["telegram.daily_list"] = QCheckBox("قائمة الحضور اليومية بالأسماء، الساعة")
+        W["telegram.daily_list"] = QCheckBox("تقرير الحضور (من حضر ومن لم يحضر، لكل مجموعة) في الساعات:")
         W["telegram.daily_list"].setChecked(bool(s["telegram.daily_list"]))
         W["telegram.daily_time"] = QLineEdit(s["telegram.daily_time"])
-        W["telegram.daily_time"].setInputMask("99:99")
-        W["telegram.daily_time"].setMaximumWidth(90)
+        W["telegram.daily_time"].setPlaceholderText("09:05، 17:05")
+        W["telegram.daily_time"].setMaximumWidth(180)
         row = QHBoxLayout()
         row.addWidget(W["telegram.daily_list"])
         row.addWidget(W["telegram.daily_time"])
@@ -266,7 +266,7 @@ class SettingsPage(Page):
         f.addRow("", row)
         self.tg_test = button("إرسال رسالة تجريبية", "send", "primary")
         self.tg_test.clicked.connect(self._tg_test)
-        self.tg_list = button("إرسال قائمة اليوم الآن", "report")
+        self.tg_list = button("إرسال تقرير الحضور الآن", "report")
         self.tg_list.clicked.connect(self._tg_send_list)
         row = QHBoxLayout()
         row.addWidget(self.tg_test)
@@ -455,11 +455,14 @@ class SettingsPage(Page):
             error(self, "وقت «بداية اليوم» غير صحيح؛ اكتبه بصيغة ساعة:دقيقة مثل 04:00.")
             return
         values["attendance.day_start"] = day_start
-        daily_time = valid_hhmm(values["telegram.daily_time"])
-        if daily_time is None:
-            error(self, "وقت قائمة الحضور اليومية غير صحيح؛ اكتبه مثل 17:05.")
+        try:
+            times = telegram.parse_times(values["telegram.daily_time"])
+        except ValueError:
+            times = []
+        if not times:
+            error(self, "ساعات تقرير الحضور غير صحيحة؛ اكتبها مثل 09:05، 17:05.")
             return
-        values["telegram.daily_time"] = daily_time
+        values["telegram.daily_time"] = "، ".join(t.strftime("%H:%M") for t in times)
         if values["telegram.enabled"] and not (values["telegram.token"] and values["telegram.chat_id"]):
             error(self, "لتفعيل إشعارات تلغرام أدخل رمز البوت ومعرّف المجموعة.")
             return
@@ -541,13 +544,13 @@ class SettingsPage(Page):
         if not telegram.enabled(self.db):
             error(self, "فعّل إشعارات تلغرام واحفظ الإعدادات أولاً.")
             return
-        if not telegram.queue_daily_list(self.db, self.db.now().date()):
-            info(self, "لا يوجد دوام اليوم، فلم تُرسل قائمة.")
+        if not telegram.queue_report(self.db, self.db.now().date(), self.db.now().time()):
+            info(self, "لا يوجد دوام اليوم، فلم يُرسل تقرير.")
             return
         if self.ctx.telegram:
             self.ctx.telegram.wake()
         self._tg_status()
-        self.toast("أُضيفت قائمة اليوم إلى الإرسال", "ok")
+        self.toast("أُضيف تقرير الحضور إلى الإرسال", "ok")
 
     # ------------------------------------------------------------ backup
     def _backup_now(self):

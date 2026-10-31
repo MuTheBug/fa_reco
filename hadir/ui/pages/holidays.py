@@ -31,7 +31,8 @@ FIXED_HOLIDAYS = [
 class HolidaysPage(Page):
     def __init__(self, ctx):
         super().__init__(ctx)
-        header = PageHeader("العطل الرسمية", "العطل التي لا يُحسب فيها غياب؛ يمكن تخصيص عطلة لمجموعات معينة")
+        header = PageHeader("العطل الرسمية", "العطل التي لا يُحسب فيها غياب؛ يمكن تخصيص عطلة لمجموعات معينة."
+                            " العطلة العامة لا توقف نوبات الحرس؛ لتشملهم اختر مجموعاتهم في العطلة")
         self.lay.addWidget(header)
         add = button("إضافة عطلة", "plus", "primary")
         add.clicked.connect(lambda: self.edit(None))

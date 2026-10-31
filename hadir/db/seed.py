@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from .schema import SEED_END, SEED_RULES, SEED_SCHEDULE, SEED_START
+from .schema import (ADMIN_GROUP, DEFAULT_GROUPS, GUARD_RULES, SEED_END, SEED_RULES, SEED_SCHEDULE,
+                     SEED_START, rotation_anchor)
 from .store import Database
 
 DEFAULT_LEAVE_TYPES = [
@@ -18,7 +19,7 @@ DEFAULT_LEAVE_TYPES = [
 
 
 def seed_defaults(db: Database) -> None:
-    """Create leave types, a standard schedule and a default group (idempotent)."""
+    """Create leave types, the schedules and the three groups (idempotent)."""
     with db.tx():
         if not db.scalar("SELECT COUNT(*) FROM leave_types"):
             for t in DEFAULT_LEAVE_TYPES:
@@ -30,5 +31,12 @@ def seed_defaults(db: Database) -> None:
             days = [work, work, work, work, off, off, work]
             sid = db.schedules.save(dict(name=SEED_SCHEDULE, kind="weekly", days=days, **SEED_RULES))
             if not db.scalar("SELECT COUNT(*) FROM emp_groups"):
-                gid = db.groups.save("الموظفون", "المجموعة الافتراضية")
+                gid = db.groups.save(ADMIN_GROUP, "الدوام الرسمي")
                 db.groups.assign_schedule(gid, sid, "2000-01-01")
+                today = db.now().date()
+                for group, description, schedule, days, continuous in DEFAULT_GROUPS:
+                    anchor = rotation_anchor(today) if continuous else today.isoformat()
+                    sid = db.schedules.save(dict(name=schedule, kind="cycle", cycle_anchor=anchor, days=days,
+                                                 continuous=continuous, **GUARD_RULES))
+                    gid = db.groups.save(group, description)
+                    db.groups.assign_schedule(gid, sid, "2000-01-01")

@@ -37,15 +37,23 @@ def add_emp(db, code="1001", name="أحمد علي", group=None):
 def test_seed_and_schema(db):
     assert db.schema_version == len(MIGRATIONS)
     assert len(db.leaves.types()) == 6
-    sched = db.schedules.all_engine()
-    [s] = sched.values()
+    sched = {s.name: s for s in db.schedules.all_engine().values()}
+    assert set(sched) == {"الدوام الرسمي", "دوام الحرس", "النوبة الأسبوعية"}
+    s = sched["الدوام الرسمي"]
     shift = s.shift_for(date(2026, 10, 25))  # Sunday
     assert (shift.start.time(), shift.end.time()) == (time(8, 0), time(14, 45))
     assert s.shift_for(date(2026, 10, 30)) is None  # Friday
     assert (s.grace_late, s.absent_after, s.exit_until) == (30, 60, time(17, 0))
     assert s.early_absent and s.missing_absent
     seed_defaults(db)  # idempotent
-    assert len(db.schedules.list()) == 1
+    assert len(db.schedules.list()) == 3
+    groups = {g["name"]: db.groups.current_schedule(g["id"])["name"] for g in db.groups.list()}
+    assert groups == {"الموظفون الإداريون": "الدوام الرسمي", "الحرس": "دوام الحرس",
+                      "حرس النوبات الأسبوعية": "النوبة الأسبوعية"}
+    weekly = sched["النوبة الأسبوعية"]
+    block = weekly.block_for(weekly.cycle_anchor)
+    assert weekly.continuous and block.length == 7 and block.start.time() == time(8, 0)
+    assert weekly.cycle_anchor.weekday() == 6  # weekly duties start on Sunday
 
 
 def test_auth_and_failed_login_event(db):
@@ -238,7 +246,7 @@ def test_upgrade_applies_new_rules_from_upgrade_day(tmp_path):
     db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
     assert db.schema_version == len(MIGRATIONS)
     rows = {r["name"]: r for r in db.schedules.list()}
-    assert set(rows) == {"الدوام الرسمي", "الدوام الرسمي (حتى 2026/10/27)"}
+    assert set(rows) == {"الدوام الرسمي", "الدوام الرسمي (حتى 2026/10/27)", "دوام الحرس", "النوبة الأسبوعية"}
     assert not rows["الدوام الرسمي (حتى 2026/10/27)"]["active"]
     new = db.schedules.get(rows["الدوام الرسمي"]["id"])
     assert (new.grace_late, new.absent_after, new.exit_until) == (30, 60, time(17, 0))
@@ -255,15 +263,30 @@ def test_upgrade_applies_new_rules_from_upgrade_day(tmp_path):
 def test_upgrade_without_history_updates_in_place(tmp_path):
     make_v1_db(tmp_path / "v1.db", punches=())
     db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
-    [row] = db.schedules.list()
-    assert row["name"] == "الدوام الرسمي" and row["absent_after"] == 60 and row["exit_until"] == "17:00"
+    row = db.one("SELECT * FROM schedules WHERE name = 'الدوام الرسمي'")
+    assert row["absent_after"] == 60 and row["exit_until"] == "17:00"
+    assert db.scalar("SELECT COUNT(*) FROM schedules WHERE name LIKE 'الدوام الرسمي%'") == 1
 
 
 def test_upgrade_leaves_a_changed_schedule_alone(tmp_path):
     make_v1_db(tmp_path / "v1.db", grace_late=15)
     db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
-    [row] = db.schedules.list()
+    row = db.one("SELECT * FROM schedules WHERE name = 'الدوام الرسمي'")
     assert (row["grace_late"], row["absent_after"], row["exit_until"]) == (15, 0, None)
+
+
+def test_upgrade_adds_the_guard_groups(tmp_path):
+    make_v1_db(tmp_path / "v1.db")
+    db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 29, 10, 0)))  # a Thursday
+    groups = {g["name"]: g for g in db.groups.list()}
+    assert set(groups) == {"الموظفون الإداريون", "الحرس", "حرس النوبات الأسبوعية"}
+    assert db.employees.get(1)["group_name"] == "الموظفون الإداريون"  # the old default group, renamed
+    weekly = db.schedules.get(db.groups.current_schedule(groups["حرس النوبات الأسبوعية"]["id"])["id"])
+    assert weekly.continuous and weekly.cycle_anchor == date(2026, 10, 25)
+    guards = db.schedules.get(db.groups.current_schedule(groups["الحرس"]["id"])["id"])
+    assert guards.kind == "cycle" and len(guards.days) == 3 and guards.cycle_anchor == date(2026, 10, 29)
+    eid = db.employees.save(dict(full_name="حارس", group_id=groups["الحرس"]["id"], cycle_start="2026-10-30"))
+    assert db.employees.get(eid)["cycle_start"] == "2026-10-30"
 
 
 # ------------------------------------------------------------ employees and rules

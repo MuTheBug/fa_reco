@@ -189,3 +189,23 @@ def test_telegram_settings_need_token_and_hide_it_from_the_audit_log(window, qap
     logged = " ".join(r["details"] for r in db.q("SELECT details FROM audit_log"))
     assert "telegram.token" in logged and "123:ABC" not in logged
     assert "تلغرام" in page.about_lbl.text()
+
+
+def test_guard_form_asks_for_the_first_duty_day(window, qapp, monkeypatch):
+    from datetime import date
+
+    from hadir.ui.pages import employees
+
+    db = window.ctx.db
+    dlg = employees.EmployeeDialog(window.ctx, None, window)
+    assert not dlg.form.isRowVisible(dlg.cycle_row)  # administrative staff have no rotation
+    weekly = db.scalar("SELECT id FROM emp_groups WHERE name = 'حرس النوبات الأسبوعية'")
+    dlg.group.setCurrentIndex(dlg.group.findData(weekly))
+    assert dlg.form.isRowVisible(dlg.cycle_row)
+    assert dlg.cycle_hint.text() == "نوبة متصلة 7 أيام تبدأ 08:00، ثم استراحة 7 أيام"
+    dlg.name.setText("حارس جديد")
+    dlg.cycle_start.set_value(date(2026, 11, 1))
+    monkeypatch.setattr(employees, "confirm", lambda *a, **k: False)
+    dlg.save()
+    e = db.employees.get(dlg.employee_id)
+    assert e["group_id"] == weekly and e["cycle_start"] == "2026-11-01"

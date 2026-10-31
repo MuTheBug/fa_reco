@@ -6,6 +6,7 @@ import random
 from datetime import date, datetime, timedelta
 
 from .core.timeutil import daterange
+from .db.schema import ADMIN_GROUP, DEFAULT_GROUPS, rotation_anchor
 from .db.seed import seed_defaults
 from .db.store import Database
 
@@ -25,32 +26,27 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
     phones = random.Random(seed + 1)  # separate stream: the attendance data stays the same
     seed_defaults(db)
     with db.tx():
-        base_group = db.scalar("SELECT id FROM emp_groups ORDER BY id")
-        db.groups.save("الموظفون", "الدوام الصباحي الاعتيادي", base_group)
-        evening = db.schedules.save(dict(
-            name="الدوام المسائي", kind="weekly", grace_late=10,
-            days=[(True, "14:00", "20:00")] * 4 + [(False, None, None)] * 2 + [(True, "14:00", "20:00")]))
-        duty = db.schedules.save(dict(
-            name="مناوبة ٢٤ ساعة", kind="cycle", cycle_anchor=(today - timedelta(days=60)).isoformat(),
-            grace_late=15, window_before=180, window_after=360,
-            days=[(True, "08:00", "08:00"), (False, None, None), (False, None, None)]))
-        g_eve = db.groups.save("الشعبة المسائية", "دوام مسائي")
-        db.groups.assign_schedule(g_eve, evening, "2000-01-01")
-        g_duty = db.groups.save("المناوبون", "حراسة وخدمات بنظام ٢٤/٤٨")
-        db.groups.assign_schedule(g_duty, duty, "2000-01-01")
+        groups = {g["name"]: g["id"] for g in db.groups.list()}
+        admin = groups[ADMIN_GROUP]
+        guards, weekly = (groups[g[0]] for g in DEFAULT_GROUPS)
         n_side = min(3, employees // 4)
-        plan = [base_group] * (employees - 2 * n_side) + [g_eve] * n_side + [g_duty] * n_side
+        plan = [admin] * (employees - 2 * n_side) + [guards] * n_side + [weekly] * n_side
         ids = []
         start = today - timedelta(days=days)
         for i in range(employees):
             name = f"{rnd.choice(FIRST)} {rnd.choice(FATHER)} {rnd.choice(FAMILY)}"
-            eid = db.employees.save(dict(
-                code=str(1001 + i), full_name=name, job_title=rnd.choice(JOBS),
-                phone=f"07{phones.choice('789')}{phones.randint(0, 99_999_999):08d}",
-                department=rnd.choice(["الإدارة", "الحسابات", "الشؤون الفنية", "الخدمات"]),
-                hire_date=(start - timedelta(days=400)).isoformat(), group_id=plan[i]),
-                group_effective="2000-01-01")
-            ids.append(eid)
+            data = dict(code=str(1001 + i), full_name=name, job_title=rnd.choice(JOBS),
+                        phone=f"07{phones.choice('789')}{phones.randint(0, 99_999_999):08d}",
+                        department=rnd.choice(["الإدارة", "الحسابات", "الشؤون الفنية", "الخدمات"]),
+                        hire_date=(start - timedelta(days=400)).isoformat(), group_id=plan[i])
+            # guards take turns: each has his own first duty day
+            k = i - (employees - 2 * n_side)
+            if plan[i] == guards:
+                data.update(job_title="حارس", cycle_start=(today - timedelta(days=k % 3)).isoformat())
+            elif plan[i] == weekly:
+                first = date.fromisoformat(rotation_anchor(today)) - timedelta(days=7 * (k % 2))
+                data.update(job_title="حارس", cycle_start=first.isoformat())
+            ids.append(db.employees.save(data, group_effective="2000-01-01"))
         def pick(i):
             return ids[i % len(ids)]
 
@@ -68,6 +64,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
 
     org = db.load_org()
     emps = {e.id: e for e in db.load_employees(ids, start, today)}
+    now = db.now()
     with db.tx():
         for eid in ids:
             emp = emps[eid]
@@ -75,7 +72,10 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
             for d in daterange(start, today - timedelta(days=1)):
                 gid = emp.group_on(d)
                 sched = org.schedule_for(emp, d, gid)
-                shift = sched.shift_for(d) if sched else None
+                block = sched.block_for(d) if sched else None
+                if block is not None and d != block.first:
+                    continue  # inside a continuous duty: punched only when joining and at the end
+                shift = block.shift if block is not None else sched.shift_for(d) if sched else None
                 if shift is None or d == holiday:
                     continue
                 if any(lv.start <= d <= lv.end and not lv.hourly for lv in emp.leaves):
@@ -97,8 +97,8 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
                 leave += timedelta(seconds=rnd.randint(0, 59))
                 db.punches.add_face(eid, arrive.replace(microsecond=0), score=round(rnd.uniform(0.62, 0.9), 3),
                                     liveness=round(rnd.uniform(0.85, 1.0), 3))
-                if r > 0.98:
-                    continue  # forgot to punch out
+                if r > 0.98 or leave >= now:
+                    continue  # forgot to punch out, or still on duty
                 db.punches.add_face(eid, leave.replace(microsecond=0), score=round(rnd.uniform(0.62, 0.9), 3),
                                     liveness=round(rnd.uniform(0.85, 1.0), 3))
         # a few corrections with written reasons

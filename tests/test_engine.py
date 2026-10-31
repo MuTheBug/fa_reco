@@ -369,3 +369,112 @@ def test_rules_off_keep_the_old_behaviour(org):
     assert r.status == E.PRESENT and r.late == 90 and r.early == 60
     r = one_day(emp(["2026-10-25 08:00"]), org, SUN)
     assert r.status == E.PRESENT and "missing_out" in r.flags
+
+
+# ---------------------------------------------------------------- rotations
+GUARD_RULES = dict(grace_late=30, absent_after=60, exit_until=T("10:00"), early_absent=True,
+                   missing_absent=True)
+
+
+def weekly_duty(anchor=date(2026, 10, 25), **kw):
+    """Seven days of continuous duty from 08:00, then seven days off."""
+    days = tuple([E.DayRule(True, T("08:00"), T("08:00"))] * 7 + [E.DayRule(False)] * 7)
+    return E.Schedule(3, "النوبة الأسبوعية", "cycle", days, cycle_anchor=anchor, continuous=True,
+                      **(GUARD_RULES | kw))
+
+
+def guard(punches=(), cycle_start=None, leaves=()):
+    e = emp(punches, leaves=leaves)
+    e.cycle_start = cycle_start
+    return e
+
+
+def week(e, org, now=None, start=date(2026, 10, 25), end=date(2026, 11, 1)):
+    return E.compute_days(e, org, start, end, now=now)
+
+
+@pytest.fixture
+def duty_org():
+    return org_with(weekly_duty(), group_sched={1: [(3, date(2020, 1, 1))]})
+
+
+def test_weekly_duty_needs_one_punch_on_joining_and_one_at_the_end(duty_org):
+    days = week(guard(["2026-10-25 07:55", "2026-11-01 08:10"]), duty_org)
+    assert [d.status for d in days[:7]] == [E.PRESENT] * 7
+    assert days[0].check_in == datetime(2026, 10, 25, 7, 55) and days[0].check_out is None
+    assert days[6].check_out == datetime(2026, 11, 1, 8, 10) and days[6].check_in is None
+    assert all("on_duty" in d.flags and d.label == "في النوبة" for d in days[1:6])
+    assert days[7].status == E.REST and days[7].label == "استراحة"
+    assert E.summarize(days).present_days == 7 and E.summarize(days).absent_days == 0
+
+
+def test_weekly_duty_late_joining_and_early_leaving(duty_org):
+    late = week(guard(["2026-10-25 08:40", "2026-11-01 08:00"]), duty_org)
+    assert late[0].status == E.PRESENT and late[0].late == 40
+    after_cutoff = week(guard(["2026-10-26 10:00", "2026-11-01 08:00"]), duty_org)
+    assert [d.status for d in after_cutoff[:3]] == [E.ABSENT, E.ABSENT, E.PRESENT]
+    assert "absent_late" in after_cutoff[1].flags and after_cutoff[1].check_in is not None
+    early = week(guard(["2026-10-25 08:00", "2026-10-29 12:00"]), duty_org)
+    assert [d.status for d in early[:7]] == [E.PRESENT] * 4 + [E.ABSENT] * 3
+    assert early[4].check_out == datetime(2026, 10, 29, 12, 0) and "absent_early" in early[4].flags
+
+
+def test_weekly_duty_missing_exit_and_no_show(duty_org):
+    gone = week(guard(["2026-10-25 08:00"]), duty_org)
+    assert [d.status for d in gone[:7]] == [E.PRESENT] * 6 + [E.ABSENT]
+    assert "missing_out" in gone[6].flags
+    nobody = week(guard(), duty_org)
+    assert [d.status for d in nobody[:7]] == [E.ABSENT] * 7
+    r = week(guard(), duty_org, now=datetime(2026, 10, 25, 8, 45))
+    assert r[0].status == E.PENDING and r[1].status == E.FUTURE
+
+
+def test_weekly_duty_in_progress(duty_org):
+    now = datetime(2026, 10, 28, 12, 0)
+    days = week(guard(["2026-10-25 08:00"]), duty_org, now=now)
+    assert [d.status for d in days[:4]] == [E.PRESENT] * 4 and "at_work" in days[3].flags
+    assert [d.status for d in days[4:7]] == [E.FUTURE] * 3
+    assert days[3].worked == 240  # 08:00 to 12:00 of the fourth day
+
+
+def test_weekly_duty_part_of_the_range_and_leave(duty_org):
+    annual = E.LeaveType(1, "اعتيادية")
+    e = guard(["2026-10-25 08:00", "2026-11-01 08:00"],
+              leaves=[E.Leave(1, annual, date(2026, 10, 28), date(2026, 10, 28))])
+    middle = E.compute_days(e, duty_org, date(2026, 10, 27), date(2026, 10, 29))
+    assert [d.status for d in middle] == [E.PRESENT, E.LEAVE, E.PRESENT]
+    assert middle[0].check_in is None and "on_duty" in middle[0].flags
+
+
+def test_weekly_duty_kiosk_reads_the_end_punch_as_exit(duty_org):
+    e = guard(["2026-10-25 08:00"])
+    kind, rec = E.classify_new_punch(e, duty_org, datetime(2026, 11, 1, 8, 5))
+    assert kind == "out" and rec.date == date(2026, 10, 31)
+    kind, _ = E.classify_new_punch(guard(), duty_org, datetime(2026, 10, 25, 7, 58))
+    assert kind == "in"
+
+
+def test_personal_rotation_start(duty_org):
+    # This guard's own rotation starts a week later: the first week is rest for him.
+    e = guard(["2026-11-01 08:00", "2026-11-08 08:00"], cycle_start=date(2026, 11, 1))
+    days = week(e, duty_org, end=date(2026, 11, 8))
+    assert [d.status for d in days[:7]] == [E.REST] * 7
+    assert [d.status for d in days[7:14]] == [E.PRESENT] * 7
+    # A 24-hour duty every third day: teams take turns through their own start days.
+    days3 = tuple([E.DayRule(True, T("08:00"), T("08:00")), E.DayRule(False), E.DayRule(False)])
+    guards = E.Schedule(4, "دوام الحرس", "cycle", days3, cycle_anchor=date(2026, 10, 25), **GUARD_RULES)
+    org = org_with(guards, group_sched={1: [(4, date(2020, 1, 1))]})
+    second_team = guard(["2026-10-26 08:00", "2026-10-27 08:05"], cycle_start=date(2026, 10, 26))
+    r = E.compute_days(second_team, org, date(2026, 10, 25), date(2026, 10, 27))
+    assert [d.status for d in r] == [E.REST, E.PRESENT, E.REST]
+    assert r[1].check_out == datetime(2026, 10, 27, 8, 5)
+
+
+def test_general_holidays_do_not_stop_guard_rotations(duty_org):
+    general = E.Holiday(1, "عطلة عامة", date(2026, 10, 27), date(2026, 10, 27))
+    duty_org.holidays = [general]
+    days = week(guard(["2026-10-25 08:00", "2026-11-01 08:00"]), duty_org)
+    assert days[2].status == E.PRESENT  # the guard is on duty through the general holiday
+    duty_org.holidays = [E.Holiday(2, "عطلة الحرس", date(2026, 10, 27), date(2026, 10, 27),
+                                   frozenset({1}))]
+    assert week(guard(["2026-10-25 08:00", "2026-11-01 08:00"]), duty_org)[2].status == E.HOLIDAY

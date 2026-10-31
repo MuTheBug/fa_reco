@@ -21,6 +21,7 @@ from ..theme import C, icon
 from ..widgets.camera_view import CameraView
 from ..widgets.common import (Card, DataTable, DateEdit, PageHeader, SearchBox, button, confirm,
                               error, info, label)
+from .schedules import schedule_summary
 
 POSE_LABELS = {"front": "أمامي", "left": "يسار", "right": "يمين", "up": "للأعلى", "down": "للأسفل",
                "photo": "صورة", "auto": "تحديث تلقائي"}
@@ -303,6 +304,18 @@ class EmployeeDialog(QDialog):
             self.group.hide()
             self.group_from_lbl.hide()
             self.group_from.hide()
+        # Guards on a rotation take turns: each has his own first duty day.
+        self.cycle_start = DateEdit(self.db.now().date())
+        self.cycle_hint = label("", "Hint", wrap=True)
+        self.cycle_row = QWidget()
+        cl = QHBoxLayout(self.cycle_row)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.addWidget(self.cycle_start)
+        cl.addWidget(self.cycle_hint, 1)
+        form.addRow("أول يوم نوبة:", self.cycle_row)
+        self.form = form
+        self._cycle_set = False
+        self.group.currentIndexChanged.connect(self._group_changed)
         if self.employee_id:
             form.addRow("", self.active)
         if self.ctx.setting("kiosk.allow_pin"):
@@ -392,6 +405,7 @@ class EmployeeDialog(QDialog):
         if e is None:
             self.active.setChecked(True)
             self.group.setCurrentIndex(max(0, self.group.findData(self.db.employees.default_group())))
+            self._group_changed()
             self.group_from_lbl.hide()
             self.group_from.hide()
             for i in (1, 2):
@@ -405,9 +419,24 @@ class EmployeeDialog(QDialog):
         self.code_hint.setText(f"الرقم الوظيفي للتسجيل بالرمز السري: {e['code']}")
         self._orig_group = e["group_id"]
         self.group.setCurrentIndex(max(0, self.group.findData(e["group_id"])))
+        if e["cycle_start"]:
+            self.cycle_start.set_value(parse_date(e["cycle_start"]))
+            self._cycle_set = True
+        self._group_changed()
         self._load_photo()
         self._load_samples()
         self._load_schedule()
+
+    def _group_changed(self, *_):
+        """Show «أول يوم نوبة» only for a group working on a rotation."""
+        gid = self.group.currentData() if self.show_group else self.db.employees.default_group()
+        sched = self.db.groups.current_schedule(gid) if gid else None
+        rotation = sched is not None and sched["kind"] == "cycle"
+        self.form.setRowVisible(self.cycle_row, rotation)
+        if rotation:
+            self.cycle_hint.setText(schedule_summary(self.db, sched["id"]))
+            if not self._cycle_set and sched["cycle_anchor"]:
+                self.cycle_start.set_value(parse_date(sched["cycle_anchor"]))
 
     def _load_photo(self):
         data = self.db.employees.photo(self.employee_id) if self.employee_id else None
@@ -456,6 +485,8 @@ class EmployeeDialog(QDialog):
             None if self.employee_id else self.db.employees.default_group())
         if group is not None:
             data["group_id"] = group
+        if self.form.isRowVisible(self.cycle_row):
+            data["cycle_start"] = self.cycle_start.value()
         effective = self.group_from.value() if self.employee_id else None
         try:
             new_id = self.db.employees.save(data, self.employee_id, group_effective=effective)

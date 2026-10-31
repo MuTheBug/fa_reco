@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from ..core import engine as E
-from ..core.timeutil import digits, fmt_date, fmt_time, parse_time, weekday_name
+from ..core.timeutil import digits, fmt_date, fmt_time, weekday_name
 
 API = "https://api.telegram.org/bot{token}/{method}"
 MAX_TEXT = 3900  # Telegram accepts up to 4096 characters per message
@@ -114,8 +115,12 @@ def day_status(rec: E.DayRecord, punch_type: str | None = None) -> str:
 
 def punch_text(emp, punch_type: str, rec: E.DayRecord, ts: datetime) -> str:
     """Name, job description, entry (and exit) time and the day's status."""
-    lines = ["🟢 تسجيل حضور" if punch_type == "in" else "🔴 تسجيل انصراف",
-             f"الاسم: {emp['full_name']}"]
+    block = rec.schedule.block_for(rec.date) if rec.schedule is not None and rec.shift is not None else None
+    if block is not None:
+        title = "🟢 التحاق بالنوبة" if punch_type == "in" else "🔴 انتهاء النوبة"
+    else:
+        title = "🟢 تسجيل حضور" if punch_type == "in" else "🔴 تسجيل انصراف"
+    lines = [title, f"الاسم: {emp['full_name']}"]
     if emp["job_title"]:
         lines.append(f"الصفة: {emp['job_title']}")
     if punch_type == "in":
@@ -124,48 +129,103 @@ def punch_text(emp, punch_type: str, rec: E.DayRecord, ts: datetime) -> str:
         if rec.check_in is not None and rec.check_in != ts:
             lines.append(f"وقت الدخول: {fmt_time(rec.check_in)}")
         lines.append(f"وقت الخروج: {fmt_time(ts)}")
+    if block is not None:
+        lines.append(f"النوبة: من {weekday_name(block.start.date())} {fmt_date(block.start.date())}"
+                     f" {fmt_time(block.start)} إلى {weekday_name(block.end.date())} {fmt_date(block.end.date())}"
+                     f" {fmt_time(block.end)}")
     lines.append(f"الحالة: {day_status(rec, punch_type)}")
     lines.append(f"التاريخ: {weekday_name(ts.date())} {fmt_date(ts.date())}")
     return "\n".join(lines)
 
 
-def daily_list(db, day: date) -> list[str]:
-    """The day's attendance by name, split into messages; [] when nobody works that day."""
+REPORT_SECTIONS = {
+    "present": "✅ حضروا وسجّلوا البصمة",
+    "absent": "❌ لم يحضروا أو لم يسجّلوا البصمة",
+    "pending": "⏳ لم يحضروا بعد",
+    "off": "🏖 إجازة أو عطلة أو استراحة",
+}
+
+
+def report_line(name: str, job: str, rec: E.DayRecord) -> tuple[str, str]:
+    """(section, text) of one employee in the attendance report."""
+    def clock(ts: datetime) -> str:  # a guard's duty ends the next morning
+        return fmt_time(ts) + (" من اليوم التالي" if ts.date() > rec.date else "")
+
+    who = f"{name} ({job})" if job else name
+    parts = []
+    if rec.status == E.PRESENT:
+        if rec.check_in:
+            parts.append(f"دخول {clock(rec.check_in)}")
+        if rec.check_out:
+            parts.append(f"خروج {clock(rec.check_out)}")
+        if rec.late:
+            parts.append(f"متأخر {digits(rec.late)} دقيقة")
+        if rec.early:
+            parts.append(f"خروج مبكر {digits(rec.early)} دقيقة")
+        if "on_duty" in rec.flags:
+            parts.append("في النوبة")
+        section = "present"
+    elif rec.status == E.ABSENT:
+        if "absent_late" in rec.flags and rec.check_in:
+            parts.append(f"حضر {fmt_time(rec.check_in)} بعد وقت الغياب")
+        elif "absent_late" in rec.flags:
+            parts.append("لم يلتحق بالنوبة")
+        elif "absent_early" in rec.flags and rec.check_out:
+            parts.append(f"خرج {clock(rec.check_out)} قبل وقت الخروج")
+        elif "absent_early" in rec.flags:
+            parts.append("ترك النوبة قبل نهايتها")
+        elif "missing_out" in rec.flags:
+            parts.append("لم يسجّل الانصراف")
+        elif "missing_in" in rec.flags:
+            parts.append("لم يسجّل الحضور")
+        section = "absent"
+    elif rec.status == E.PENDING:
+        section = "pending"
+    else:
+        parts.append(rec.label)
+        section = "off"
+    return section, " — ".join([who] + parts)
+
+
+def attendance_report(db, day: date, at: time | None = None) -> list[str]:
+    """Who attended and punched and who did not, group by group, split into messages.
+
+    [] when nobody is due to work that day.
+    """
     from ..reports.sources import select_employees
 
-    ids = select_employees(db, day, day)
-    jobs = {r["id"]: r["job_title"] for r in db.q("SELECT id, job_title FROM employees")}
-    people = sorted(db.compute(ids, day, day), key=lambda er: er[0].name)
+    people = sorted(db.compute(select_employees(db, day, day), day, day), key=lambda er: er[0].name)
     if not any(rec.shift is not None and rec.status not in (E.HOLIDAY, E.REST) for _, [rec] in people):
         return []
-    counts = {"present": 0, "late": 0, "absent": 0, "leave": 0}
-    lines = []
+    jobs = {r["id"]: r["job_title"] for r in db.q("SELECT id, job_title FROM employees")}
+    names = {g["id"]: g["name"] for g in db.q("SELECT id, name FROM emp_groups ORDER BY id")}
+    groups: dict[str, dict[str, list[str]]] = {name: {} for name in names.values()}
     for emp, [rec] in people:
         if rec.status in (E.INACTIVE, E.FUTURE):
             continue
-        parts = [f"{digits(len(lines) + 1)}. {emp.name}"]
-        if jobs.get(emp.id):
-            parts.append(jobs[emp.id])
-        if rec.check_in:
-            parts.append(f"دخول {fmt_time(rec.check_in)}")
-        if rec.check_out:
-            parts.append(f"خروج {fmt_time(rec.check_out)}")
-        parts.append(day_status(rec))
-        lines.append(" — ".join(parts))
-        if rec.counts_present:
-            counts["present"] += 1
-        if rec.late:
-            counts["late"] += 1
-        if rec.status == E.ABSENT:
-            counts["absent"] += 1
-        elif rec.status == E.LEAVE:
-            counts["leave"] += 1
-    head = [f"📋 قائمة الحضور — {weekday_name(day)} {fmt_date(day)}", db.settings.get("org.name") or "", ""]
-    foot = ["", f"الحاضرون: {digits(counts['present'])} • المتأخرون: {digits(counts['late'])}"
-                f" • الغائبون: {digits(counts['absent'])} • المجازون: {digits(counts['leave'])}"]
-    messages, current = [], head
-    for line in lines + foot:
-        if len("\n".join(current + [line])) > MAX_TEXT:
+        section, text = report_line(emp.name, jobs.get(emp.id, ""), rec)
+        groups.setdefault(names.get(rec.group_id, "بدون مجموعة"), {}).setdefault(section, []).append(text)
+    title = f"📋 تقرير الحضور — {weekday_name(day)} {fmt_date(day)}"
+    if at is not None:
+        title += f" — الساعة {fmt_time(at)}"
+    lines = [title, db.settings.get("org.name") or ""]
+    totals = dict.fromkeys(REPORT_SECTIONS, 0)
+    for group, sections in groups.items():
+        if not sections:
+            continue
+        due = sum(len(sections.get(k, [])) for k in ("present", "absent", "pending"))
+        lines += ["", f"👥 {group} — حضر {digits(len(sections.get('present', [])))} من {digits(due)}"]
+        for key, heading in REPORT_SECTIONS.items():
+            entries = sections.get(key, [])
+            totals[key] += len(entries)
+            if entries:
+                lines.append(f"{heading} ({digits(len(entries))}):")
+                lines += [f"{digits(n)}. {text}" for n, text in enumerate(entries, start=1)]
+    lines += ["", f"المجموع: حضر {digits(totals['present'])} • لم يحضر {digits(totals['absent'])}"
+                  f" • لم يصل بعد {digits(totals['pending'])} • إجازة أو عطلة أو استراحة {digits(totals['off'])}"]
+    messages, current = [], []
+    for line in lines:
+        if current and len("\n".join(current + [line])) > MAX_TEXT:
             messages.append("\n".join(current))
             current = []
         current.append(line)
@@ -178,23 +238,43 @@ def queue_punch(db, emp, punch_type: str, rec: E.DayRecord, ts: datetime) -> Non
         db.outbox.add("punch", punch_text(emp, punch_type, rec, ts))
 
 
-def queue_daily_list(db, day: date) -> int:
-    """Queue the day's list; returns the number of messages (0 when nobody works that day)."""
-    messages = daily_list(db, day) if enabled(db) else []
+def queue_report(db, day: date, at: time | None = None) -> int:
+    """Queue the day's attendance report; returns the number of messages (0 when nobody works)."""
+    messages = attendance_report(db, day, at) if enabled(db) else []
     for text in messages:
-        db.outbox.add("daily_list", text)
+        db.outbox.add("report", text)
     return len(messages)
 
 
-def daily_list_due(db, now: datetime) -> bool:
-    """Once a day, after the chosen time."""
+def parse_times(text: str) -> list[time]:
+    """«09:05، 17:05» -> [09:05, 17:05]; ValueError for anything that is not a time of day."""
+    out = set()
+    for part in re.split(r"[,،\s]+", (text or "").strip()):
+        if not part:
+            continue
+        hh, _, mm = part.partition(":")
+        if not (hh.isdigit() and mm.isdigit() and int(hh) < 24 and int(mm) < 60):
+            raise ValueError(part)
+        out.add(time(int(hh), int(mm)))
+    return sorted(out)
+
+
+def report_due(db, now: datetime) -> time | None:
+    """The latest report time that has passed today and whose report was not sent yet."""
     if not (enabled(db) and db.settings.get("telegram.daily_list")):
-        return False
+        return None
     try:
-        at = parse_time(db.settings.get("telegram.daily_time")) or parse_time("17:05")
+        times = parse_times(db.settings.get("telegram.daily_time")) or [time(17, 5)]
     except ValueError:
-        at = parse_time("17:05")
-    return now.time() >= at and db.settings.get("telegram.last_list") != now.date().isoformat()
+        times = [time(17, 5)]
+    passed = [t for t in times if t <= now.time()]
+    if not passed:
+        return None
+    slot = f"{now.date().isoformat()} {passed[-1].strftime('%H:%M')}"
+    last = db.settings.get("telegram.last_list") or ""
+    if last >= slot or last == now.date().isoformat():  # a bare date: version 1.1 sent today's list
+        return None
+    return passed[-1]
 
 
 # ---------------------------------------------------------------- sender

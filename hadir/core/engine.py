@@ -23,11 +23,17 @@ Key rules
   a missing check-in/check-out (``missing_absent``) make the day an absence.
   ``exit_until`` is the last time an exit punch is accepted; a missing
   check-out is final only after it.
+* An employee may have a personal ``cycle_start``: their own first duty day on
+  a rotation (cycle) schedule, so teams of one group can take turns.
+* On a ``continuous`` schedule consecutive duty days are one duty (for
+  example a week on guard): one punch when joining and one at the end.  Each
+  day of it still gets its own record: on duty, absent before joining or after
+  leaving early, and the exit punch is expected after the last day.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 
 from .timeutil import minutes_between
@@ -67,6 +73,7 @@ FLAG_LABELS = {
     "overdue": "تجاوز وقت الحضور",
     "absent_late": "حضر بعد وقت الغياب",
     "absent_early": "خرج قبل وقت الخروج",
+    "on_duty": "في النوبة",
 }
 
 # Why a day with punches still counts as an absence, in the order they are reported.
@@ -111,6 +118,7 @@ class Schedule:
     exit_until: time | None = None  # last exit punch; a missing check-out is final after it
     early_absent: bool = False  # leaving before the exit time is an absence, not an early leave
     missing_absent: bool = False  # a missing check-in or check-out makes the day an absence
+    continuous: bool = False  # consecutive duty days are one duty: punch on joining and at the end
 
     def rule_for(self, d: date) -> DayRule | None:
         if not self.days:
@@ -130,6 +138,28 @@ class Schedule:
             end += timedelta(days=1)
         return Shift(d, start, end)
 
+    def with_anchor(self, anchor: date | None) -> Schedule:
+        """The same rotation started on another day (an employee's own first duty day)."""
+        if self.kind != "cycle" or anchor is None or anchor == self.cycle_anchor:
+            return self
+        return replace(self, cycle_anchor=anchor)
+
+    def block_for(self, d: date) -> Block | None:
+        """On a continuous schedule, the run of consecutive duty days around ``d``."""
+        if not self.continuous or self.shift_for(d) is None:
+            return None
+        limit = len(self.days)
+        first = last = d
+        for _ in range(limit):
+            if self.shift_for(first - timedelta(days=1)) is None:
+                break
+            first -= timedelta(days=1)
+        for _ in range(limit):
+            if self.shift_for(last + timedelta(days=1)) is None:
+                break
+            last += timedelta(days=1)
+        return Block(first, last, self.shift_for(first).start, self.shift_for(last).end)
+
     def exit_deadline(self, shift: Shift) -> datetime | None:
         """The first ``exit_until`` at or after the end of the shift."""
         if self.exit_until is None:
@@ -138,6 +168,23 @@ class Schedule:
         if deadline < shift.end:
             deadline += timedelta(days=1)
         return deadline
+
+
+@dataclass(frozen=True)
+class Block:
+    """Consecutive duty days of a continuous schedule, worked as one duty."""
+    first: date
+    last: date
+    start: datetime
+    end: datetime
+
+    @property
+    def shift(self) -> Shift:
+        return Shift(self.first, self.start, self.end)
+
+    @property
+    def length(self) -> int:
+        return (self.last - self.first).days + 1
 
 
 @dataclass(frozen=True)
@@ -168,10 +215,13 @@ class Holiday:
     end: date
     group_ids: frozenset = frozenset()  # empty: applies to everybody
 
-    def applies(self, d: date, group_id: int | None) -> bool:
+    def applies(self, d: date, group_id: int | None, rotation: bool = False) -> bool:
+        """Rotations (guards) keep their turns on a general holiday; only one naming their group stops them."""
         if not (self.start <= d <= self.end):
             return False
-        return not self.group_ids or group_id in self.group_ids
+        if not self.group_ids:
+            return not rotation
+        return group_id in self.group_ids
 
 
 @dataclass(frozen=True)
@@ -229,6 +279,7 @@ class EmployeeData:
     assignments: list[Assignment] = field(default_factory=list)
     leaves: list[Leave] = field(default_factory=list)
     punches: list[Punch] = field(default_factory=list)
+    cycle_start: date | None = None  # own first duty day on a rotation schedule
 
     def active_on(self, d: date) -> bool:
         if self.hire_date and d < self.hire_date:
@@ -258,7 +309,8 @@ class OrgData:
         best = _latest(a for a in emp.assignments if a.covers(d))
         if best is None and group_id is not None:
             best = _latest(a for a in self.group_assignments.get(group_id, ()) if a.covers(d))
-        return self.schedules.get(best.schedule_id) if best else None
+        schedule = self.schedules.get(best.schedule_id) if best else None
+        return schedule.with_anchor(emp.cycle_start) if schedule else None
 
 
 def _latest(items):
@@ -318,6 +370,8 @@ class DayRecord:
             return self.holiday.name
         if self.status == ABSENT and self.absence_reason:
             return f"{STATUS_LABELS[ABSENT]} ({self.absence_reason})"
+        if self.status == REST and self.schedule is not None and self.schedule.kind == "cycle":
+            return "استراحة"
         if self.status == PRESENT:
             parts = []
             if self.late:
@@ -328,6 +382,8 @@ class DayRecord:
                 parts.append(FLAG_LABELS["missing_out"])
             if "missing_in" in self.flags:
                 parts.append(FLAG_LABELS["missing_in"])
+            if "on_duty" in self.flags and not parts:
+                parts.append(FLAG_LABELS["on_duty"])
             if "at_work" in self.flags and not parts:
                 parts.append(FLAG_LABELS["at_work"])
             return "، ".join(parts) if parts else STATUS_LABELS[PRESENT]
@@ -341,6 +397,7 @@ class _Slot:
     ws: datetime
     we: datetime
     punches: list = field(default_factory=list)
+    block: Block | None = None
 
     def contains(self, ts: datetime) -> bool:
         if self.shift is not None:
@@ -371,28 +428,52 @@ def dedupe(punches: list[Punch], seconds: int) -> list[Punch]:
     return out
 
 
+def _window(schedule: Schedule, shift: Shift) -> tuple[datetime, datetime]:
+    """Punches between these times belong to the shift."""
+    ws = shift.start - timedelta(minutes=schedule.window_before)
+    we = shift.end + timedelta(minutes=schedule.window_after)
+    deadline = schedule.exit_deadline(shift)
+    return ws, (deadline if deadline is not None and deadline > we else we)
+
+
+def _block_on(emp: EmployeeData, org: OrgData, d: date) -> Block | None:
+    schedule = org.schedule_for(emp, d, emp.group_on(d))
+    return schedule.block_for(d) if schedule else None
+
+
 def compute_days(emp: EmployeeData, org: OrgData, start: date, end: date,
                  now: datetime | None = None) -> list[DayRecord]:
     """Compute one DayRecord per calendar day in [start, end]."""
     first, last = start - timedelta(days=1), end + timedelta(days=1)
+    # A continuous duty that overlaps the range is computed as a whole.
+    for edge in (first, last):
+        block = _block_on(emp, org, edge)
+        if block is not None:
+            first = min(first, block.first - timedelta(days=1))
+            last = max(last, block.last + timedelta(days=1))
     ctx = {}
     slots: list[_Slot] = []
+    block_slots: dict[date, _Slot] = {}
     d = first
     while d <= last:
         group_id = emp.group_on(d)
         schedule = org.schedule_for(emp, d, group_id)
-        shift = schedule.shift_for(d) if schedule else None
-        if shift is not None:
-            ws = shift.start - timedelta(minutes=schedule.window_before)
-            we = shift.end + timedelta(minutes=schedule.window_after)
-            deadline = schedule.exit_deadline(shift)
-            if deadline is not None and deadline > we:
-                we = deadline
+        block = schedule.block_for(d) if schedule else None
+        if block is not None:
+            slot = block_slots.get(block.first)
+            if slot is None:
+                ws, we = _window(schedule, block.shift)
+                slot = block_slots[block.first] = _Slot(block.first, block.shift, ws, we, block=block)
+                slots.append(slot)
         else:
-            ws = datetime.combine(d, org.day_start)
-            we = ws + timedelta(days=1)
-        slot = _Slot(d, shift, ws, we)
-        slots.append(slot)
+            shift = schedule.shift_for(d) if schedule else None
+            if shift is not None:
+                ws, we = _window(schedule, shift)
+            else:
+                ws = datetime.combine(d, org.day_start)
+                we = ws + timedelta(days=1)
+            slot = _Slot(d, shift, ws, we)
+            slots.append(slot)
         ctx[d] = (group_id, schedule, slot)
         d += timedelta(days=1)
 
@@ -415,10 +496,17 @@ def compute_days(emp: EmployeeData, org: OrgData, start: date, end: date,
         slot.punches.append(p)
 
     records = []
+    blocks: dict[date, dict] = {}
     d = start
     while d <= end:
         group_id, schedule, slot = ctx[d]
-        records.append(_compute_day(emp, org, d, group_id, schedule, slot, now))
+        if slot.block is None:
+            records.append(_compute_day(emp, org, d, group_id, schedule, slot, now))
+        else:
+            if slot.block.first not in blocks:
+                g, sch, _ = ctx[slot.block.first]
+                blocks[slot.block.first] = _compute_block(emp, org, g, sch, slot, now)
+            records.append(blocks[slot.block.first][d])
         d += timedelta(days=1)
     return records
 
@@ -447,14 +535,7 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     today = now.date() if now else None
     # Is the work day finished (so a missing punch is final)?
     shift_over = now is None or now >= (shift.end if shift is not None else slot.we)
-    for p in punches:
-        if p.source != "face":
-            rec.flags.add("manual")
-        if p.corrected:
-            rec.flags.add("corrected")
-        if (org.low_liveness and p.source == "face" and p.liveness is not None
-                and p.liveness < org.low_liveness):
-            rec.flags.add("low_liveness")
+    _punch_flags(rec, org)
 
     # check-in / check-out
     if len(punches) >= 2:
@@ -479,7 +560,8 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
 
     day_leaves = [lv for lv in emp.leaves if not lv.hourly and lv.start <= d <= lv.end]
     full_leave = day_leaves[0] if day_leaves else None
-    holiday = next((h for h in org.holidays if h.applies(d, group_id)), None)
+    rotation = schedule is not None and schedule.kind == "cycle"
+    holiday = next((h for h in org.holidays if h.applies(d, group_id, rotation)), None)
     hourly = _hourly_intervals(emp.leaves, shift, d)
     rec.hourly_leaves = [h[2] for h in hourly]
 
@@ -586,6 +668,162 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     return rec
 
 
+def _punch_flags(rec: DayRecord, org: OrgData) -> None:
+    for p in rec.punches:
+        if p.source != "face":
+            rec.flags.add("manual")
+        if p.corrected:
+            rec.flags.add("corrected")
+        if (org.low_liveness and p.source == "face" and p.liveness is not None
+                and p.liveness < org.low_liveness):
+            rec.flags.add("low_liveness")
+
+
+def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule, slot: _Slot,
+                   now: datetime | None) -> dict[date, DayRecord]:
+    """The days of one continuous duty: a check-in when joining, a check-out at the end."""
+    block, shift = slot.block, slot.shift
+    punches = sorted(slot.punches, key=lambda p: p.ts)
+    today = now.date() if now else None
+    check_in = check_out = None
+    if len(punches) >= 2:
+        check_in, check_out = punches[0].ts, punches[-1].ts
+    elif punches:
+        p = punches[0]
+        over = now is None or now >= shift.end
+        nearer_end = abs((p.ts - shift.end).total_seconds()) < abs((p.ts - shift.start).total_seconds())
+        if p.kind == "out" or (p.kind != "in" and over and nearer_end):
+            check_out = p.ts
+        else:
+            check_in = p.ts
+
+    # joining: rules as for a normal day, measured from the start of the duty
+    hourly = _hourly_intervals(emp.leaves, shift, block.first)
+    grace = timedelta(minutes=schedule.grace_late)
+    eff_start = shift.start
+    for s, e, _ in hourly:
+        if s <= eff_start + grace and e > eff_start:
+            eff_start = e
+    cutoff = eff_start + timedelta(minutes=schedule.absent_after) if schedule.absent_after else None
+    late, joined_late = 0, False
+    if check_in is not None:
+        if cutoff is not None and check_in > cutoff:
+            joined_late = True
+        elif check_in > eff_start + grace:
+            base = eff_start + grace if schedule.late_after_grace else eff_start
+            late = minutes_between(base, check_in)
+    # leaving: at the end of the last day
+    eff_end = shift.end
+    grace_early = timedelta(minutes=schedule.grace_early)
+    for s, e, _ in sorted(hourly, key=lambda x: x[1], reverse=True):
+        if e >= eff_end - grace_early and s < eff_end:
+            eff_end = s
+    left_early = check_out is not None and check_out < eff_end - grace_early
+    overtime = 0
+    if check_out is not None and check_out > shift.end:
+        extra = minutes_between(shift.end, check_out)
+        overtime = extra if extra >= schedule.overtime_min else 0
+    deadline = schedule.exit_deadline(shift)
+    exit_closed = now is None or now >= (deadline or shift.end)
+
+    n = block.length
+    bounds = [(shift.start + timedelta(days=i),
+               shift.end if i == n - 1 else min(shift.start + timedelta(days=i + 1), shift.end))
+              for i in range(n)]
+
+    def piece(ts: datetime) -> int:
+        """The day of the duty a moment belongs to (before it: the first, after it: the last)."""
+        return next((i for i, (_, e) in enumerate(bounds) if ts < e), n - 1)
+
+    join = piece(check_in) if check_in is not None else None
+    leaving = piece(check_out) if check_out is not None else None
+    by_piece: dict[int, list] = {}
+    for p in punches:
+        by_piece.setdefault(piece(p.ts), []).append(p)
+
+    out = {}
+    for i, (s, e) in enumerate(bounds):
+        d = block.first + timedelta(days=i)
+        rec = out[d] = DayRecord(emp.id, d, PRESENT, group_id=group_id, schedule=schedule,
+                                 shift=Shift(d, s, e), punches=by_piece.get(i, []))
+        rec.required = minutes_between(s, e)
+        _punch_flags(rec, org)
+        day_leave = next((lv for lv in emp.leaves if not lv.hourly and lv.start <= d <= lv.end), None)
+        holiday = next((h for h in org.holidays if h.applies(d, group_id, schedule.kind == "cycle")), None)
+        on_duty = join is not None and join <= i and (leaving is None or i <= leaving)
+        if not emp.active_on(d):
+            rec.status = INACTIVE
+            continue
+        if holiday and not (day_leave and day_leave.type.calendar_days):
+            rec.status, rec.holiday = HOLIDAY, holiday
+            if on_duty:
+                rec.flags.add("worked_off_day")
+            continue
+        if day_leave:
+            rec.status, rec.leave = LEAVE, day_leave
+            continue
+        if check_in is None and check_out is None:  # nobody joined (yet)
+            if today is not None and d > today:
+                rec.status = FUTURE
+            elif now is not None and ((i == 0 and now <= (cutoff or e)) or (i > 0 and now < s)):
+                rec.status = PENDING
+                if i == 0 and now >= shift.start + grace:
+                    rec.flags.add("overdue")
+            else:
+                rec.status = ABSENT
+            continue
+        absence = []
+        if check_in is None:  # only an exit punch: joining was not recorded
+            if i <= leaving:
+                rec.flags.add("missing_in")
+                if schedule.missing_absent:
+                    absence.append("missing_in")
+            else:
+                absence.append("absent_early")
+        elif i < join:
+            absence.append("absent_late")
+        elif i == join:
+            rec.check_in = check_in
+            if joined_late:
+                absence.append("absent_late")
+            else:
+                rec.late = late
+        if check_out is not None:
+            if i == leaving:
+                rec.check_out = check_out
+                if left_early:
+                    if schedule.early_absent:
+                        absence.append("absent_early")
+                    else:
+                        rec.early = minutes_between(check_out, min(e, eff_end))
+                if i == n - 1:
+                    rec.overtime = overtime
+            elif leaving is not None and i > leaving:
+                if "absent_early" not in absence:
+                    absence.append("absent_early")
+        elif exit_closed:
+            if i == n - 1:
+                rec.flags.add("missing_out")
+                if schedule.missing_absent:
+                    absence.append("missing_out")
+        elif today is not None and d > today:
+            rec.status = FUTURE
+            continue
+        elif now is not None and s <= now < e:
+            rec.flags.add("at_work")
+        if check_in is not None:
+            until = check_out or (min(now, shift.end) if now is not None and not exit_closed else None)
+            if until is not None and min(e, until) > max(s, check_in):
+                rec.worked = minutes_between(max(s, check_in), min(e, until))
+        if absence:
+            rec.status = ABSENT
+            rec.flags.update(f for f in absence if f.startswith("absent_"))
+            rec.late = rec.early = rec.overtime = 0
+        elif i not in (join, leaving):
+            rec.flags.add("on_duty")
+    return out
+
+
 def _covered_minutes(hourly, shift: Shift) -> int:
     total = 0
     cursor = shift.start
@@ -678,8 +916,7 @@ def classify_new_punch(emp: EmployeeData, org: OrgData, ts: datetime) -> tuple[s
     Returns ("in" | "out", the resulting day record).
     """
     probe = Punch(id=-1, ts=ts)
-    trial = EmployeeData(emp.id, emp.name, emp.code, emp.hire_date, emp.end_date, emp.groups,
-                         emp.assignments, emp.leaves, list(emp.punches) + [probe])
+    trial = replace(emp, punches=list(emp.punches) + [probe])
     days = compute_days(trial, org, ts.date() - timedelta(days=1), ts.date() + timedelta(days=1),
                         now=ts)
     for rec in days:

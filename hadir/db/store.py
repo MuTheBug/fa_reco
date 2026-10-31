@@ -201,7 +201,8 @@ class Database:
             rows = self.q(f"SELECT * FROM employees WHERE id IN ({marks}) ORDER BY full_name", ids)
         ids = [r["id"] for r in rows]
         out = {r["id"]: E.EmployeeData(
-            r["id"], r["full_name"], r["code"], parse_date(r["hire_date"]), parse_date(r["end_date"]))
+            r["id"], r["full_name"], r["code"], parse_date(r["hire_date"]), parse_date(r["end_date"]),
+            cycle_start=parse_date(r["cycle_start"]))
             for r in rows}
         if not ids:
             return []
@@ -213,7 +214,9 @@ class Database:
             out[r["employee_id"]].assignments.append(
                 E.Assignment(r["schedule_id"], parse_date(r["start_date"]), parse_date(r["end_date"])))
         types = self.leaves.types_engine()
-        lo, hi = (start - timedelta(days=2)).isoformat(), (end + timedelta(days=2)).isoformat()
+        # A continuous duty around the period is computed whole: load its punches and leaves too.
+        margin = 2 + self.schedules.longest_continuous()
+        lo, hi = (start - timedelta(days=margin)).isoformat(), (end + timedelta(days=margin)).isoformat()
         for r in self.q(f"SELECT * FROM leaves WHERE cancelled = 0 AND employee_id IN ({marks})"
                         " AND start_date <= ? AND end_date >= ?", ids + [hi, lo]):
             out[r["employee_id"]].leaves.append(E.Leave(
@@ -222,8 +225,8 @@ class Database:
                 r["note"]))
         corrected = {r[0] for r in self.q(
             f"SELECT DISTINCT punch_id FROM corrections WHERE employee_id IN ({marks})", ids)}
-        lo_ts = (start - timedelta(days=2)).isoformat() + " 00:00:00"
-        hi_ts = (end + timedelta(days=3)).isoformat() + " 00:00:00"
+        lo_ts = (start - timedelta(days=margin)).isoformat() + " 00:00:00"
+        hi_ts = (end + timedelta(days=margin + 1)).isoformat() + " 00:00:00"
         for r in self.q(f"SELECT * FROM punches WHERE deleted = 0 AND employee_id IN ({marks})"
                         " AND ts >= ? AND ts < ? ORDER BY ts", ids + [lo_ts, hi_ts]):
             out[r["employee_id"]].punches.append(E.Punch(
@@ -437,7 +440,7 @@ class SchedulesRepo(_Repo):
                           row["window_before"], row["window_after"], row["overtime_min"],
                           absent_after=row["absent_after"], exit_until=parse_time(row["exit_until"]),
                           early_absent=bool(row["early_absent"]),
-                          missing_absent=bool(row["missing_absent"]))
+                          missing_absent=bool(row["missing_absent"]), continuous=bool(row["continuous"]))
 
     def get(self, schedule_id: int) -> E.Schedule | None:
         row = self.db.one("SELECT * FROM schedules WHERE id = ?", (schedule_id,))
@@ -453,7 +456,7 @@ class SchedulesRepo(_Repo):
     def save(self, data: dict, schedule_id: int | None = None) -> int:
         """data: name, kind, cycle_anchor, grace_late, grace_early, late_after_grace,
         window_before, window_after, overtime_min, absent_after, exit_until 'HH:MM' or None,
-        early_absent, missing_absent, notes, active,
+        early_absent, missing_absent, continuous, notes, active,
         days: [(workday, start 'HH:MM', end 'HH:MM'), ...]"""
         name = (data.get("name") or "").strip()
         if not name:
@@ -476,16 +479,18 @@ class SchedulesRepo(_Repo):
             raise StoreError("يوجد جدول بهذا الاسم.")
         fields = ("name", "kind", "cycle_anchor", "grace_late", "grace_early", "late_after_grace",
                   "window_before", "window_after", "overtime_min", "absent_after", "exit_until",
-                  "early_absent", "missing_absent", "notes", "active")
+                  "early_absent", "missing_absent", "continuous", "notes", "active")
         defaults = {"cycle_anchor": None, "grace_late": 10, "grace_early": 0, "late_after_grace": 0,
                     "window_before": 240, "window_after": 480, "overtime_min": 30, "absent_after": 0,
-                    "exit_until": None, "early_absent": 0, "missing_absent": 0, "notes": "",
-                    "active": 1}
+                    "exit_until": None, "early_absent": 0, "missing_absent": 0, "continuous": 0,
+                    "notes": "", "active": 1}
         values = {f: data.get(f, defaults.get(f)) for f in fields}
         values["name"], values["kind"] = name, kind
         values["cycle_anchor"] = _d(values["cycle_anchor"]) if kind == "cycle" else None
-        for f in ("late_after_grace", "early_absent", "missing_absent", "active"):
+        for f in ("late_after_grace", "early_absent", "missing_absent", "continuous", "active"):
             values[f] = int(bool(values[f]))
+        if values["continuous"] and all(wd for wd, _, _ in days):
+            raise StoreError("النوبة المتصلة تحتاج يوم استراحة واحداً على الأقل في الجدول.")
         values["absent_after"] = int(values["absent_after"] or 0)
         values["exit_until"] = _t(values["exit_until"])
         if values["absent_after"] and values["absent_after"] <= int(values["grace_late"]):
@@ -515,6 +520,12 @@ class SchedulesRepo(_Repo):
                           " end_time) VALUES (?,?,?,?,?)",
                           (schedule_id, i, int(bool(wd)), _t(st) if wd else None, _t(en) if wd else None))
         return schedule_id
+
+    def longest_continuous(self) -> int:
+        """Days in the longest continuous-duty schedule (0 if none): how far back a duty can reach."""
+        return self.db.scalar("SELECT COALESCE(MAX(n), 0) FROM (SELECT COUNT(*) AS n FROM schedule_days d"
+                              " JOIN schedules s ON s.id = d.schedule_id WHERE s.continuous = 1"
+                              " GROUP BY d.schedule_id)")
 
     def usage(self, schedule_id: int) -> int:
         return self.db.scalar("SELECT COUNT(*) FROM schedule_assignments WHERE schedule_id = ?",
@@ -592,7 +603,7 @@ class EmployeesRepo(_Repo):
         return str(max(nums) + 1 if nums else 1001)
 
     FIELDS = ("code", "full_name", "job_title", "department", "phone", "notes", "hire_date",
-              "end_date", "active")
+              "end_date", "active", "cycle_start")
 
     def save(self, data: dict, employee_id: int | None = None, group_effective=None) -> int:
         """Add an employee or change the fields present in ``data`` (others are kept).
@@ -607,7 +618,7 @@ class EmployeesRepo(_Repo):
         today = self.db.now().date()
         if old is None:
             values = dict(code="", full_name="", job_title="", department="", phone="", notes="",
-                          hire_date=None, end_date=None, active=1)
+                          hire_date=None, end_date=None, active=1, cycle_start=None)
         else:
             values = {f: old[f] for f in self.FIELDS}
         values.update({f: data[f] for f in self.FIELDS if f in data})
@@ -616,6 +627,7 @@ class EmployeesRepo(_Repo):
         values["notes"] = values["notes"] or ""
         values["active"] = int(bool(values["active"]))
         values["hire_date"], values["end_date"] = _d(values["hire_date"]), _d(values["end_date"])
+        values["cycle_start"] = _d(values["cycle_start"])
         if not values["full_name"]:
             raise StoreError("اسم الموظف مطلوب.")
         if not values["code"]:

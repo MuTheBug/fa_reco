@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QGridLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPlainTextEdit, QScrollArea, QVBoxLayout, QWidget)
 
-from ...core.timeutil import WEEK_ORDER, WEEKDAYS_AR, digits, fmt_time, parse_date, parse_time
+from ...core.timeutil import WEEK_ORDER, WEEKDAYS_AR, digits, fmt_date, fmt_time, parse_date, parse_time
 from ...db.schema import SEED_END, SEED_RULES, SEED_START
 from ...db.store import StoreError
 from ..admin import Page
@@ -16,10 +16,33 @@ from ..widgets.common import (Card, DataTable, DateEdit, PageHeader, SpinBox, Ti
                               confirm, error, label)
 
 
+def duty_runs(workdays: list[bool]) -> list[tuple[int, int]]:
+    """(first, last) index of each run of consecutive duty days, in the given order."""
+    runs, start = [], None
+    for i, work in enumerate(workdays + [False]):
+        if work and start is None:
+            start = i
+        elif not work and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    return runs
+
+
+def next_day(start: time, end: time) -> str:
+    return " (اليوم التالي)" if end <= start else ""
+
+
 def schedule_summary(db, sid: int) -> str:
     s = db.schedules.get(sid)
     if s is None:
         return ""
+    if s.continuous:
+        runs = duty_runs([r.workday for r in s.days])
+        if runs:
+            first, last = runs[0]
+            rest = len(s.days) - sum(b - a + 1 for a, b in runs)
+            text = f"نوبة متصلة {digits(last - first + 1)} أيام تبدأ {fmt_time(s.days[first].start)}"
+            return text + (f"، ثم استراحة {digits(rest)} أيام" if s.kind == "cycle" else "")
     if s.kind == "cycle":
         parts = []
         for r in s.days:
@@ -124,6 +147,8 @@ class DayRow:
         self.next_day = QLabel("")
         self.next_day.setStyleSheet("color: #b45309;")
         self.limits = (10, 0)
+        self.note: str | None = None  # replaces the hint inside a continuous duty
+        self.in_block = False  # part of a continuous duty of several days
         self.work.toggled.connect(self._toggle)
         self.start.timeChanged.connect(self._refresh)
         self.end.timeChanged.connect(self._refresh)
@@ -139,9 +164,13 @@ class DayRow:
 
     def _refresh(self, *_):
         on = self.work.isChecked()
-        self.next_day.setText("ينتهي في اليوم التالي" if on and self.end.value() <= self.start.value() else "")
+        overnight = on and not self.in_block and self.end.value() <= self.start.value()
+        self.next_day.setText("ينتهي في اليوم التالي" if overnight else "")
         if not on:
             self.hint.setText("")
+            return
+        if self.note is not None:
+            self.hint.setText(self.note)
             return
         on_time, absent = day_limits(self.start.value(), *self.limits)
         text = f"لا تأخير حتى {fmt_time(on_time)}"
@@ -203,6 +232,10 @@ class ScheduleDialog(QDialog):
         self.days_card = Card("أيام الدوام وأوقاته (يمكن تحديد أوقات مختلفة لأي يوم)")
         self.days_grid = QGridLayout()
         self.days_card.lay.addLayout(self.days_grid)
+        self.continuous = QCheckBox("أيام الدوام المتتالية نوبة واحدة متصلة: بصمة عند الالتحاق وبصمة عند انتهاء"
+                                    " النوبة (مثل النوبة الأسبوعية)")
+        self.continuous.toggled.connect(self._limits_changed)
+        self.days_card.lay.addWidget(self.continuous)
         fill = button("نسخ وقت أول يوم دوام إلى بقية أيام الدوام", kind="ghost")
         fill.clicked.connect(self._fill)
         self.days_card.lay.addWidget(fill, 0, Qt.AlignRight)
@@ -296,6 +329,8 @@ class ScheduleDialog(QDialog):
             for c, w in enumerate((row.label, row.work, label("الدوام من"), row.start, label("الخروج"),
                                    row.end, row.hint, row.next_day)):
                 self.days_grid.addWidget(w, r, c)
+            row.work.toggled.connect(self._limits_changed)
+            row.end.timeChanged.connect(self._limits_changed)
             self.rows.append(row)
         for i, row in enumerate(self.rows):
             if weekly:
@@ -307,7 +342,21 @@ class ScheduleDialog(QDialog):
         self._limits_changed()
 
     def _limits_changed(self, *_):
-        for r in self.rows:
+        notes: dict[int, str] = {}
+        in_block: set[int] = set()
+        if self.continuous.isChecked():
+            for first, last in duty_runs([r.work.isChecked() for r in self.rows]):
+                if last > first:
+                    in_block.update(range(first, last + 1))
+                for i in range(first + 1, last + 1):
+                    notes[i] = "ضمن النوبة المتصلة"
+                if last > first:
+                    end = self.rows[last]
+                    notes[last] = (f"ضمن النوبة، وتنتهي النوبة {fmt_time(end.end.value())}"
+                                   f"{next_day(end.start.value(), end.end.value())}")
+        for i, r in enumerate(self.rows):
+            r.note = notes.get(i)
+            r.in_block = i in in_block
             r.set_limits(self.grace_late.value(), self.absent_after.value())
 
     def _fill(self):
@@ -345,6 +394,7 @@ class ScheduleDialog(QDialog):
             d = by_index.get(r.index)
             if d:
                 r.set(bool(d["workday"]), parse_time(d["start_time"]), parse_time(d["end_time"]))
+        self.continuous.setChecked(bool(row["continuous"]))
         self.grace_late.setValue(row["grace_late"])
         self.late_after.setChecked(bool(row["late_after_grace"]))
         self.absent_after.setValue(row["absent_after"])
@@ -375,6 +425,7 @@ class ScheduleDialog(QDialog):
                     cycle_anchor=None if weekly else self.anchor.value(),
                     grace_late=self.grace_late.value(), late_after_grace=self.late_after.isChecked(),
                     absent_after=self.absent_after.value(), early_absent=self.early_mode.currentData(),
+                    continuous=self.continuous.isChecked(),
                     missing_absent=self.missing_mode.currentData(),
                     exit_until=self.exit_until.value() if self.has_exit_until.isChecked() else None,
                     grace_early=self.grace_early.value(), window_before=self.win_before.value() * 60,
@@ -484,21 +535,39 @@ class RulesOverview(Card):
         else:
             titles = [(i, f"اليوم {digits(i + 1)}") for i in range(len(s.days))]
         last = fmt_time(s.exit_until) if s.exit_until else "—"
+        order = [i for i, _ in titles]
+        inside: dict[int, str] = {}  # continuous duty: the days after joining
+        if s.continuous:
+            for a, b in duty_runs([i < len(s.days) and s.days[i].workday for i in order]):
+                inside.update({order[k]: "middle" for k in range(a + 1, b + 1)})
+                inside.update({order[a]: "first", order[b]: "last" if a != b else "first"})
         rows = []
         for i, title in titles:
             r = s.days[i] if i < len(s.days) else None
             if r is None or not r.workday:
-                rows.append({"day": title, "start": "عطلة", "_tone": "muted"})
+                rows.append({"day": title, "start": "استراحة" if s.kind == "cycle" else "عطلة", "_tone": "muted"})
                 continue
             on_time, absent = day_limits(r.start, s.grace_late, s.absent_after)
-            rows.append({"day": title, "start": fmt_time(r.start), "on_time": fmt_time(on_time),
-                         "absent": fmt_time(absent) if absent else "—", "exit": fmt_time(r.end), "last": last})
+            row = {"day": title, "start": fmt_time(r.start), "on_time": fmt_time(on_time),
+                   "absent": fmt_time(absent) if absent else "—",
+                   "exit": fmt_time(r.end) + next_day(r.start, r.end), "last": last}
+            if inside.get(i) in ("middle", "last"):
+                row.update(start="ضمن النوبة", on_time="", absent="")
+            if inside.get(i) in ("first", "middle"):
+                row.update(exit="", last="")
+            rows.append(row)
         self.table.set_rows(rows)
         early = "غياب (إلا بإجازة زمنية)" if s.early_absent else "خروج مبكر"
         missing = "غياب" if s.missing_absent else "بصمة ناقصة"
         late = "لا يُحتسب غياباً" if not s.absent_after else f"بعد {digits(s.absent_after)} دقيقة غياب"
-        self.rules.setText(f"التأخير: بعد {digits(s.grace_late)} دقيقة من بداية الدوام، و{late} •"
-                           f" الخروج قبل وقته: {early} • عدم تسجيل الحضور أو الانصراف: {missing}")
+        text = (f"التأخير: بعد {digits(s.grace_late)} دقيقة من بداية الدوام، و{late} •"
+                f" الخروج قبل وقته: {early} • عدم تسجيل الحضور أو الانصراف: {missing}")
+        if s.continuous:
+            text += " • نوبة متصلة: بصمة عند الالتحاق وبصمة عند انتهاء النوبة"
+        if s.kind == "cycle" and s.cycle_anchor:
+            text += (f" • أول يوم في الدورة: {fmt_date(s.cycle_anchor)}، ولكل حارس يوم بداية خاص يُحدَّد"
+                     " في بياناته (أول يوم نوبة)")
+        self.rules.setText(text)
 
     def _edit(self):
         sid = self.pick.currentData()

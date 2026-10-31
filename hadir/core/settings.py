@@ -54,8 +54,8 @@ DEFAULTS: dict = {
     "telegram.token": "",
     "telegram.chat_id": "",
     "telegram.punches": True,  # a message for every check-in and check-out
-    "telegram.daily_list": True,  # the day's attendance list by name
-    "telegram.daily_time": "17:05",
+    "telegram.daily_list": True,  # the attendance report: who came and who did not, by group
+    "telegram.daily_time": "09:05، 17:05",  # one or more times of day
 }
 
 # Values never written to the audit log.

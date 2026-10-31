@@ -186,12 +186,13 @@ class MainWindow(QMainWindow):
             purge_snapshots(snapshots_dir(), int(db.settings.get("kiosk.snapshot_days") or 0), db.now())
             db.settings.set("maintenance.last_purge", today, audit=False)
         try:
-            if telegram.daily_list_due(db, db.now()):
-                db.settings.set("telegram.last_list", today, audit=False)
-                if telegram.queue_daily_list(db, db.now().date()) and self.ctx.telegram:
+            at = telegram.report_due(db, db.now())
+            if at is not None:
+                db.settings.set("telegram.last_list", f"{today} {at:%H:%M}", audit=False)
+                if telegram.queue_report(db, db.now().date(), at) and self.ctx.telegram:
                     self.ctx.telegram.wake()
         except Exception as exc:  # the attendance screen must keep working whatever happens here
-            db.events.add("telegram", f"تعذّر إعداد قائمة الحضور اليومية: {exc}")
+            db.events.add("telegram", f"تعذّر إعداد تقرير الحضور: {exc}")
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):
