@@ -43,7 +43,7 @@ def test_seed_and_schema(db):
     shift = s.shift_for(date(2026, 10, 25))  # Sunday
     assert (shift.start.time(), shift.end.time()) == (time(8, 0), time(14, 45))
     assert s.shift_for(date(2026, 10, 30)) is None  # Friday
-    assert (s.grace_late, s.absent_after, s.exit_until) == (30, 60, time(17, 0))
+    assert (s.grace_late, s.absent_after, s.exit_until, s.exit_window) == (30, 60, time(17, 0), 15)
     assert s.early_absent and s.missing_absent
     seed_defaults(db)  # idempotent
     assert len(db.schedules.list()) == 3
@@ -249,7 +249,7 @@ def test_upgrade_applies_new_rules_from_upgrade_day(tmp_path):
     assert set(rows) == {"الدوام الرسمي", "الدوام الرسمي (حتى 2026/10/27)", "دوام الحرس", "النوبة الأسبوعية"}
     assert not rows["الدوام الرسمي (حتى 2026/10/27)"]["active"]
     new = db.schedules.get(rows["الدوام الرسمي"]["id"])
-    assert (new.grace_late, new.absent_after, new.exit_until) == (30, 60, time(17, 0))
+    assert (new.grace_late, new.absent_after, new.exit_until, new.exit_window) == (30, 60, time(17, 0), 15)
     assert new.shift_for(date(2026, 10, 28)).end.time() == time(14, 45)
     assert db.employees.get(1)["hire_date"] == "2026-10-27"  # filled in from the day he was added
     db.punches.add_face(1, datetime(2026, 10, 28, 8, 40))
@@ -272,7 +272,7 @@ def test_upgrade_leaves_a_changed_schedule_alone(tmp_path):
     make_v1_db(tmp_path / "v1.db", grace_late=15)
     db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))
     row = db.one("SELECT * FROM schedules WHERE name = 'الدوام الرسمي'")
-    assert (row["grace_late"], row["absent_after"], row["exit_until"]) == (15, 0, None)
+    assert (row["grace_late"], row["absent_after"], row["exit_until"], row["exit_window"]) == (15, 0, None, 0)
 
 
 def test_upgrade_adds_the_guard_groups(tmp_path):
@@ -331,3 +331,16 @@ def test_schedule_rules_roundtrip_and_validation(db):
         db.schedules.save(dict(name="خطأ ١", days=days, grace_late=30, absent_after=20))
     with pytest.raises(StoreError):  # last exit punch before the exit time
         db.schedules.save(dict(name="خطأ ٢", days=days, exit_until="14:00"))
+
+
+def test_personal_times_are_saved_and_used(db):
+    eid = add_emp(db)
+    db.employees.save(dict(own_start="09:00", own_end=time(14, 0)), eid)
+    e = db.employees.get(eid)
+    assert (e["own_start"], e["own_end"]) == ("09:00", "14:00")
+    db.punches.add_face(eid, datetime(2026, 10, 25, 9, 20))
+    db.punches.add_face(eid, datetime(2026, 10, 25, 13, 50))
+    [(emp, [day])] = db.compute([eid], date(2026, 10, 25), date(2026, 10, 25))
+    assert (day.status, day.late, day.early) == (E.PRESENT, 0, 10)
+    db.employees.save(dict(own_start=None, own_end=None), eid)
+    assert db.employees.get(eid)["own_start"] is None

@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 SEED_SCHEDULE = "الدوام الرسمي"
 # The department's rules: Sunday-Thursday from 08:00, on time until 08:30, absent after 09:00,
 # exit from 14:45 (leaving earlier or not punching counts as an absence), exit punches until 17:00.
-SEED_RULES = dict(grace_late=30, absent_after=60, exit_until="17:00", early_absent=1, missing_absent=1)
+SEED_RULES_V11 = dict(grace_late=30, absent_after=60, exit_until="17:00", early_absent=1, missing_absent=1)
+# Since 1.3 exit punches count from 14:30 (an early exit until 14:45).
+SEED_RULES = dict(SEED_RULES_V11, exit_window=15)
 SEED_START, SEED_END = "08:00", "14:45"
 
 
@@ -58,8 +60,8 @@ def upgrade_seed_schedule(conn, now: datetime) -> None:
     else:
         new = old
         conn.execute("DELETE FROM schedule_days WHERE schedule_id = ?", (new,))
-    conn.execute(f"UPDATE schedules SET {', '.join(k + ' = ?' for k in SEED_RULES)} WHERE id = ?",
-                 (*SEED_RULES.values(), new))
+    conn.execute(f"UPDATE schedules SET {', '.join(k + ' = ?' for k in SEED_RULES_V11)} WHERE id = ?",
+                 (*SEED_RULES_V11.values(), new))
     for i in range(7):
         work = i not in (4, 5)
         conn.execute("INSERT INTO schedule_days (schedule_id, day_index, workday, start_time, end_time)"
@@ -396,4 +398,13 @@ MIGRATIONS: list = [
         """,
         add_guard_groups,
     ],
+    # 4 -- exit window and personal start/exit times
+    """
+    ALTER TABLE schedules ADD COLUMN exit_window INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE employees ADD COLUMN own_start TEXT;
+    ALTER TABLE employees ADD COLUMN own_end TEXT;
+    -- The department's schedule: exit punches count from 14:30 (an early exit until 14:45).
+    UPDATE schedules SET exit_window = 15
+    WHERE name = 'الدوام الرسمي' AND grace_late = 30 AND absent_after = 60 AND exit_until = '17:00';
+    """,
 ]

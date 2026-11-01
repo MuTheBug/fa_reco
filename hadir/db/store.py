@@ -202,7 +202,8 @@ class Database:
         ids = [r["id"] for r in rows]
         out = {r["id"]: E.EmployeeData(
             r["id"], r["full_name"], r["code"], parse_date(r["hire_date"]), parse_date(r["end_date"]),
-            cycle_start=parse_date(r["cycle_start"]))
+            cycle_start=parse_date(r["cycle_start"]), own_start=parse_time(r["own_start"]),
+            own_end=parse_time(r["own_end"]))
             for r in rows}
         if not ids:
             return []
@@ -440,7 +441,8 @@ class SchedulesRepo(_Repo):
                           row["window_before"], row["window_after"], row["overtime_min"],
                           absent_after=row["absent_after"], exit_until=parse_time(row["exit_until"]),
                           early_absent=bool(row["early_absent"]),
-                          missing_absent=bool(row["missing_absent"]), continuous=bool(row["continuous"]))
+                          missing_absent=bool(row["missing_absent"]), continuous=bool(row["continuous"]),
+                          exit_window=row["exit_window"])
 
     def get(self, schedule_id: int) -> E.Schedule | None:
         row = self.db.one("SELECT * FROM schedules WHERE id = ?", (schedule_id,))
@@ -456,7 +458,7 @@ class SchedulesRepo(_Repo):
     def save(self, data: dict, schedule_id: int | None = None) -> int:
         """data: name, kind, cycle_anchor, grace_late, grace_early, late_after_grace,
         window_before, window_after, overtime_min, absent_after, exit_until 'HH:MM' or None,
-        early_absent, missing_absent, continuous, notes, active,
+        early_absent, missing_absent, continuous, exit_window, notes, active,
         days: [(workday, start 'HH:MM', end 'HH:MM'), ...]"""
         name = (data.get("name") or "").strip()
         if not name:
@@ -479,11 +481,11 @@ class SchedulesRepo(_Repo):
             raise StoreError("يوجد جدول بهذا الاسم.")
         fields = ("name", "kind", "cycle_anchor", "grace_late", "grace_early", "late_after_grace",
                   "window_before", "window_after", "overtime_min", "absent_after", "exit_until",
-                  "early_absent", "missing_absent", "continuous", "notes", "active")
+                  "early_absent", "missing_absent", "continuous", "exit_window", "notes", "active")
         defaults = {"cycle_anchor": None, "grace_late": 10, "grace_early": 0, "late_after_grace": 0,
                     "window_before": 240, "window_after": 480, "overtime_min": 30, "absent_after": 0,
                     "exit_until": None, "early_absent": 0, "missing_absent": 0, "continuous": 0,
-                    "notes": "", "active": 1}
+                    "exit_window": 0, "notes": "", "active": 1}
         values = {f: data.get(f, defaults.get(f)) for f in fields}
         values["name"], values["kind"] = name, kind
         values["cycle_anchor"] = _d(values["cycle_anchor"]) if kind == "cycle" else None
@@ -492,6 +494,7 @@ class SchedulesRepo(_Repo):
         if values["continuous"] and all(wd for wd, _, _ in days):
             raise StoreError("النوبة المتصلة تحتاج يوم استراحة واحداً على الأقل في الجدول.")
         values["absent_after"] = int(values["absent_after"] or 0)
+        values["exit_window"] = max(0, int(values["exit_window"] or 0))
         values["exit_until"] = _t(values["exit_until"])
         if values["absent_after"] and values["absent_after"] <= int(values["grace_late"]):
             raise StoreError("وقت احتساب الغياب يجب أن يكون بعد انتهاء سماحية التأخير.")
@@ -603,7 +606,7 @@ class EmployeesRepo(_Repo):
         return str(max(nums) + 1 if nums else 1001)
 
     FIELDS = ("code", "full_name", "job_title", "department", "phone", "notes", "hire_date",
-              "end_date", "active", "cycle_start")
+              "end_date", "active", "cycle_start", "own_start", "own_end")
 
     def save(self, data: dict, employee_id: int | None = None, group_effective=None) -> int:
         """Add an employee or change the fields present in ``data`` (others are kept).
@@ -618,7 +621,8 @@ class EmployeesRepo(_Repo):
         today = self.db.now().date()
         if old is None:
             values = dict(code="", full_name="", job_title="", department="", phone="", notes="",
-                          hire_date=None, end_date=None, active=1, cycle_start=None)
+                          hire_date=None, end_date=None, active=1, cycle_start=None, own_start=None,
+                          own_end=None)
         else:
             values = {f: old[f] for f in self.FIELDS}
         values.update({f: data[f] for f in self.FIELDS if f in data})
@@ -628,6 +632,7 @@ class EmployeesRepo(_Repo):
         values["active"] = int(bool(values["active"]))
         values["hire_date"], values["end_date"] = _d(values["hire_date"]), _d(values["end_date"])
         values["cycle_start"] = _d(values["cycle_start"])
+        values["own_start"], values["own_end"] = _t(values["own_start"]), _t(values["own_end"])
         if not values["full_name"]:
             raise StoreError("اسم الموظف مطلوب.")
         if not values["code"]:

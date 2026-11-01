@@ -146,7 +146,7 @@ class DayRow:
         self.hint = QLabel("")
         self.next_day = QLabel("")
         self.next_day.setStyleSheet("color: #b45309;")
-        self.limits = (10, 0)
+        self.limits = (10, 0, 0)
         self.note: str | None = None  # replaces the hint inside a continuous duty
         self.in_block = False  # part of a continuous duty of several days
         self.work.toggled.connect(self._toggle)
@@ -158,8 +158,8 @@ class DayRow:
         self.end.setEnabled(on)
         self._refresh()
 
-    def set_limits(self, grace_late: int, absent_after: int):
-        self.limits = (grace_late, absent_after)
+    def set_limits(self, grace_late: int, absent_after: int, exit_window: int = 0):
+        self.limits = (grace_late, absent_after, exit_window)
         self._refresh()
 
     def _refresh(self, *_):
@@ -172,10 +172,12 @@ class DayRow:
         if self.note is not None:
             self.hint.setText(self.note)
             return
-        on_time, absent = day_limits(self.start.value(), *self.limits)
+        on_time, absent = day_limits(self.start.value(), *self.limits[:2])
         text = f"لا تأخير حتى {fmt_time(on_time)}"
         if absent:
             text += f" • غياب بعد {fmt_time(absent)}"
+        if self.limits[2]:
+            text += f" • الخروج من {fmt_time(plus_minutes(self.end.value(), -self.limits[2]))}"
         self.hint.setText(text)
         self.hint.setStyleSheet("color: #64748b;")
 
@@ -248,6 +250,8 @@ class ScheduleDialog(QDialog):
         self.late_after = QCheckBox("يُحسب التأخير بعد انتهاء فترة السماح فقط (لا من بداية الدوام)")
         self.absent_after = SpinBox(0, 720, SEED_RULES["absent_after"], " دقيقة من بداية الدوام")
         self.absent_after.setSpecialValueText("لا يُحتسب غياباً")
+        self.exit_window = SpinBox(0, 240, SEED_RULES["exit_window"], " دقيقة (خروج مبكر)")
+        self.exit_window.setSpecialValueText("في أي وقت بعد الحضور")
         self.early_mode = QComboBox()
         self.early_mode.addItem("يُحتسب غياباً (ما لم تكن له إجازة زمنية تغطيه)", True)
         self.early_mode.addItem("يُحتسب خروجاً مبكراً", False)
@@ -264,7 +268,8 @@ class ScheduleDialog(QDialog):
         rf.addRow("لا يُعدّ متأخراً خلال:", self.grace_late)
         rf.addRow("", self.late_after)
         rf.addRow("يُعدّ غائباً إذا حضر بعد:", self.absent_after)
-        rf.addRow("الخروج قبل وقت الخروج:", self.early_mode)
+        rf.addRow("تُقبل بصمة الخروج قبل وقت الخروج بـ:", self.exit_window)
+        rf.addRow("الخروج قبل ذلك:", self.early_mode)
         rf.addRow("سماحية الخروج قبل الوقت:", self.grace_early)
         rf.addRow("عدم تسجيل الحضور أو الانصراف:", self.missing_mode)
         last = QHBoxLayout()
@@ -278,6 +283,7 @@ class ScheduleDialog(QDialog):
         rules.lay.addLayout(rf)
         self.grace_late.valueChanged.connect(self._limits_changed)
         self.absent_after.valueChanged.connect(self._limits_changed)
+        self.exit_window.valueChanged.connect(self._limits_changed)
         lay.addWidget(rules)
         self.notes = QPlainTextEdit()
         self.notes.setFixedHeight(50)
@@ -357,7 +363,7 @@ class ScheduleDialog(QDialog):
         for i, r in enumerate(self.rows):
             r.note = notes.get(i)
             r.in_block = i in in_block
-            r.set_limits(self.grace_late.value(), self.absent_after.value())
+            r.set_limits(self.grace_late.value(), self.absent_after.value(), self.exit_window.value())
 
     def _fill(self):
         first = next((r for r in self.rows if r.work.isChecked()), None)
@@ -398,6 +404,7 @@ class ScheduleDialog(QDialog):
         self.grace_late.setValue(row["grace_late"])
         self.late_after.setChecked(bool(row["late_after_grace"]))
         self.absent_after.setValue(row["absent_after"])
+        self.exit_window.setValue(row["exit_window"])
         self.early_mode.setCurrentIndex(self.early_mode.findData(bool(row["early_absent"])))
         self.missing_mode.setCurrentIndex(self.missing_mode.findData(bool(row["missing_absent"])))
         last = parse_time(row["exit_until"])
@@ -425,6 +432,7 @@ class ScheduleDialog(QDialog):
                     cycle_anchor=None if weekly else self.anchor.value(),
                     grace_late=self.grace_late.value(), late_after_grace=self.late_after.isChecked(),
                     absent_after=self.absent_after.value(), early_absent=self.early_mode.currentData(),
+                    exit_window=self.exit_window.value(),
                     continuous=self.continuous.isChecked(),
                     missing_absent=self.missing_mode.currentData(),
                     exit_until=self.exit_until.value() if self.has_exit_until.isChecked() else None,
@@ -485,7 +493,8 @@ class RulesOverview(Card):
         self.lay.addLayout(top)
         self.table = DataTable([("day", "اليوم", "text"), ("start", "بداية الدوام", "text"),
                                 ("on_time", "لا تأخير حتى", "text"), ("absent", "غياب بعد", "text"),
-                                ("exit", "وقت الخروج", "text"), ("last", "آخر بصمة خروج", "text")],
+                                ("exit_from", "الخروج من", "text"), ("exit", "الخروج في الوقت", "text"),
+                                ("last", "آخر بصمة خروج", "text")],
                                stretch="day")
         self.table.setMinimumHeight(300)
         self.lay.addWidget(self.table)
@@ -548,20 +557,27 @@ class RulesOverview(Card):
                 rows.append({"day": title, "start": "استراحة" if s.kind == "cycle" else "عطلة", "_tone": "muted"})
                 continue
             on_time, absent = day_limits(r.start, s.grace_late, s.absent_after)
+            exit_from = fmt_time(plus_minutes(r.end, -s.exit_window)) if s.exit_window else "—"
             row = {"day": title, "start": fmt_time(r.start), "on_time": fmt_time(on_time),
-                   "absent": fmt_time(absent) if absent else "—",
+                   "absent": fmt_time(absent) if absent else "—", "exit_from": exit_from,
                    "exit": fmt_time(r.end) + next_day(r.start, r.end), "last": last}
             if inside.get(i) in ("middle", "last"):
                 row.update(start="ضمن النوبة", on_time="", absent="")
             if inside.get(i) in ("first", "middle"):
-                row.update(exit="", last="")
+                row.update(exit_from="", exit="", last="")
             rows.append(row)
         self.table.set_rows(rows)
         early = "غياب (إلا بإجازة زمنية)" if s.early_absent else "خروج مبكر"
         missing = "غياب" if s.missing_absent else "بصمة ناقصة"
         late = "لا يُحتسب غياباً" if not s.absent_after else f"بعد {digits(s.absent_after)} دقيقة غياب"
-        text = (f"التأخير: بعد {digits(s.grace_late)} دقيقة من بداية الدوام، و{late} •"
-                f" الخروج قبل وقته: {early} • عدم تسجيل الحضور أو الانصراف: {missing}")
+        text = f"التأخير: بعد {digits(s.grace_late)} دقيقة من بداية الدوام، و{late} •"
+        if s.exit_window:
+            text += (f" بصمة الخروج تُقبل قبل وقته بـ {digits(s.exit_window)} دقيقة (خروج مبكر)، ولا تُقبل قبل"
+                     f" ذلك؛ ومن خرج قبلها: {early} •")
+        else:
+            text += f" الخروج قبل وقته: {early} •"
+        text += f" عدم تسجيل الحضور أو الانصراف: {missing}"
+        text += " • يمكن تحديد أوقات خاصة لأي موظف من بياناته"
         if s.continuous:
             text += " • نوبة متصلة: بصمة عند الالتحاق وبصمة عند انتهاء النوبة"
         if s.kind == "cycle" and s.cycle_anchor:

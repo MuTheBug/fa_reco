@@ -17,7 +17,7 @@ from .paths import snapshots_dir
 
 @dataclass
 class KioskResult:
-    kind: str  # punched | duplicate | unknown | spoof | ambiguous | inactive | error
+    kind: str  # punched | duplicate | early | closed | unknown | spoof | ambiguous | inactive | error
     tone: str  # ok | warn | bad
     title: str
     lines: list = field(default_factory=list)
@@ -143,6 +143,13 @@ class KioskLogic:
             return KioskResult("closed", "bad", "انتهى وقت تسجيل الخروج لهذا اليوم",
                                [f"آخر وقت للبصمة كان الساعة {fmt_time(deadline)}",
                                 "راجع مسؤول النظام إن احتجت إلى تصحيح"],
+                               employee_id, emp["full_name"], emp["code"], ts=ts)
+        opens = E.exit_opens(rec)
+        if opens is not None and ts < opens and rec.check_in not in (None, ts) and rec.check_out != ts:
+            # After the check-in, a punch before the exit window is not an exit: nothing is recorded.
+            return KioskResult("early", "warn", "لم يحن وقت الخروج بعد",
+                               [f"حضورك مسجّل الساعة {fmt_time(rec.check_in)}",
+                                f"تُقبل بصمة الخروج من الساعة {fmt_time(opens)}"],
                                employee_id, emp["full_name"], emp["code"], ts=ts)
         snap = self._snapshot(frame, box, ts, f"{emp['code']}")
         if source == "face":

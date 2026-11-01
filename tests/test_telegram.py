@@ -253,13 +253,17 @@ def test_kiosk_explains_absence_and_refuses_after_last_exit_time(db):
     assert db.scalar("SELECT COUNT(*) FROM security_events WHERE kind = 'late_punch'") == 1
 
 
-def test_kiosk_early_exit_is_flagged(db):
+def test_kiosk_exit_window(db):
     eid = add(db, "مريم")
     logic = KioskLogic(db)
     logic.register(eid, datetime(2026, 10, 25, 8, 5))
     db.clock.now = datetime(2026, 10, 25, 13, 0)
-    res = logic.register(eid, datetime(2026, 10, 25, 13, 0))
-    assert res.punch_type == "out" and res.tone == "warn" and "قبل الساعة 14:45" in res.lines[0]
+    res = logic.register(eid, datetime(2026, 10, 25, 13, 0))  # too early to be an exit: not recorded
+    assert res.kind == "early" and res.lines == ["حضورك مسجّل الساعة 08:05", "تُقبل بصمة الخروج من الساعة 14:30"]
+    assert db.scalar("SELECT COUNT(*) FROM punches WHERE employee_id = ?", (eid,)) == 1
+    db.clock.now = datetime(2026, 10, 25, 14, 35)
+    res = logic.register(eid, datetime(2026, 10, 25, 14, 35))
+    assert res.punch_type == "out" and res.tone == "ok" and res.lines[0] == "خروج مبكر بـ 10 دقيقة"
 
 
 def test_real_http_round_trip(monkeypatch):

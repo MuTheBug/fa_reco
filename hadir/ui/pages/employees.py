@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import time
+
 import cv2
 import numpy as np
 from openpyxl import Workbook, load_workbook
@@ -12,16 +14,16 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QForm
                                QProgressBar, QTabWidget, QVBoxLayout, QWidget)
 
 from ...core.settings import SECURITY_LEVELS
-from ...core.timeutil import digits, parse_date
+from ...core.timeutil import digits, fmt_time, parse_date, parse_time
 from ...db.store import StoreError
 from ...face.enroll import STEPS, chip_from_png
 from ...face.service import duplicate_candidates, save_captures
 from ..admin import Page
 from ..theme import C, icon
 from ..widgets.camera_view import CameraView
-from ..widgets.common import (Card, DataTable, DateEdit, PageHeader, SearchBox, button, confirm,
-                              error, info, label)
-from .schedules import schedule_summary
+from ..widgets.common import (Card, DataTable, DateEdit, PageHeader, SearchBox, TimeEdit, button,
+                              confirm, error, info, label)
+from .schedules import day_limits, plus_minutes, schedule_summary
 
 POSE_LABELS = {"front": "أمامي", "left": "يسار", "right": "يمين", "up": "للأعلى", "down": "للأسفل",
                "photo": "صورة", "auto": "تحديث تلقائي"}
@@ -313,9 +315,27 @@ class EmployeeDialog(QDialog):
         cl.addWidget(self.cycle_start)
         cl.addWidget(self.cycle_hint, 1)
         form.addRow("أول يوم نوبة:", self.cycle_row)
+        # Own start and exit times: lateness, absence and the exit window follow them.
+        self.own = QCheckBox("أوقات دوام خاصة بهذا الموظف")
+        self.own_start = TimeEdit(time(8, 0))
+        self.own_end = TimeEdit(time(14, 45))
+        self.own_hint = label("", "Hint", wrap=True)
+        self.own_row = QWidget()
+        ol = QHBoxLayout(self.own_row)
+        ol.setContentsMargins(0, 0, 0, 0)
+        for part in (label("يبدأ"), self.own_start, label("ويخرج"), self.own_end):
+            ol.addWidget(part)
+        ol.addWidget(self.own_hint, 1)
+        form.addRow("", self.own)
+        form.addRow("أوقاته:", self.own_row)
+        self.own.toggled.connect(self._own_changed)
+        self.own_start.timeChanged.connect(self._own_changed)
+        self.own_end.timeChanged.connect(self._own_changed)
         self.form = form
         self._cycle_set = False
+        self._own_shown = False
         self.group.currentIndexChanged.connect(self._group_changed)
+        self.group.currentIndexChanged.connect(self._own_changed)
         if self.employee_id:
             form.addRow("", self.active)
         if self.ctx.setting("kiosk.allow_pin"):
@@ -406,6 +426,7 @@ class EmployeeDialog(QDialog):
             self.active.setChecked(True)
             self.group.setCurrentIndex(max(0, self.group.findData(self.db.employees.default_group())))
             self._group_changed()
+            self._own_changed()
             self.group_from_lbl.hide()
             self.group_from.hide()
             for i in (1, 2):
@@ -423,6 +444,13 @@ class EmployeeDialog(QDialog):
             self.cycle_start.set_value(parse_date(e["cycle_start"]))
             self._cycle_set = True
         self._group_changed()
+        if e["own_start"] or e["own_end"]:
+            sched_start, sched_end = self._group_times()
+            self._own_shown = True  # keep the saved times when the box is ticked below
+            self.own_start.set_value(parse_time(e["own_start"]) or sched_start)
+            self.own_end.set_value(parse_time(e["own_end"]) or sched_end)
+            self.own.setChecked(True)
+        self._own_changed()
         self._load_photo()
         self._load_samples()
         self._load_schedule()
@@ -437,6 +465,39 @@ class EmployeeDialog(QDialog):
             self.cycle_hint.setText(schedule_summary(self.db, sched["id"]))
             if not self._cycle_set and sched["cycle_anchor"]:
                 self.cycle_start.set_value(parse_date(sched["cycle_anchor"]))
+
+    def _group_schedule(self):
+        gid = self.group.currentData() if self.show_group else self.db.employees.default_group()
+        return self.db.groups.current_schedule(gid) if gid else None
+
+    def _group_times(self) -> tuple[time, time]:
+        """Start and exit time of the first working day in the group's schedule."""
+        sched = self._group_schedule()
+        day = next((d for d in self.db.schedules.days(sched["id"]) if d["workday"]), None) if sched else None
+        if day is None:
+            return time(8, 0), time(14, 45)
+        return parse_time(day["start_time"]), parse_time(day["end_time"])
+
+    def _own_changed(self, *_):
+        """Show the employee's own times and the limits that follow from them."""
+        own = self.own.isChecked()
+        if own and not self._own_shown:
+            if self.sender() is self.own:  # just ticked: start from the group's times
+                start, end = self._group_times()
+                self.own_start.set_value(start)
+                self.own_end.set_value(end)
+            self._own_shown = True
+        self.form.setRowVisible(self.own_row, own)
+        sched = self._group_schedule()
+        if not own or sched is None:
+            return
+        on_time, absent = day_limits(self.own_start.value(), sched["grace_late"], sched["absent_after"])
+        text = f"لا تأخير حتى {fmt_time(on_time)}"
+        if absent:
+            text += f" • غياب بعد {fmt_time(absent)}"
+        if sched["exit_window"]:
+            text += f" • الخروج من {fmt_time(plus_minutes(self.own_end.value(), -sched['exit_window']))}"
+        self.own_hint.setText(text)
 
     def _load_photo(self):
         data = self.db.employees.photo(self.employee_id) if self.employee_id else None
@@ -487,6 +548,9 @@ class EmployeeDialog(QDialog):
             data["group_id"] = group
         if self.form.isRowVisible(self.cycle_row):
             data["cycle_start"] = self.cycle_start.value()
+        own = self.own.isChecked()
+        data["own_start"] = self.own_start.value() if own else None
+        data["own_end"] = self.own_end.value() if own else None
         effective = self.group_from.value() if self.employee_id else None
         try:
             new_id = self.db.employees.save(data, self.employee_id, group_effective=effective)

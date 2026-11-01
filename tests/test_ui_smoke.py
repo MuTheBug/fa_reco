@@ -78,7 +78,8 @@ def test_schedule_dialog_round_trip(window):
     sunday = data["days"][6]
     assert sunday[0] and sunday[1].strftime("%H:%M") == "08:00" and sunday[2].strftime("%H:%M") == "14:45"
     assert not data["days"][4][0]  # Friday off
-    assert next(r for r in dlg.rows if r.index == 6).hint.text() == "لا تأخير حتى 08:30 • غياب بعد 09:00"
+    assert next(r for r in dlg.rows if r.index == 6).hint.text() == (
+        "لا تأخير حتى 08:30 • غياب بعد 09:00 • الخروج من 14:30")
     # the department's rules survive opening and saving the editor
     assert (data["grace_late"], data["absent_after"], data["exit_until"].strftime("%H:%M")) == (30, 60, "17:00")
     assert data["early_absent"] is True and data["missing_absent"] is True
@@ -209,3 +210,28 @@ def test_guard_form_asks_for_the_first_duty_day(window, qapp, monkeypatch):
     dlg.save()
     e = db.employees.get(dlg.employee_id)
     assert e["group_id"] == weekly and e["cycle_start"] == "2026-11-01"
+
+
+def test_personal_times_in_the_employee_form(window, qapp):
+    from datetime import time
+
+    from hadir.ui.pages import employees
+
+    db = window.ctx.db
+    eid = db.scalar("SELECT e.id FROM employees e JOIN employee_groups g ON g.employee_id = e.id"
+                    " JOIN emp_groups x ON x.id = g.group_id WHERE x.name = 'الموظفون الإداريون' ORDER BY e.id")
+    dlg = employees.EmployeeDialog(window.ctx, eid, window)
+    assert not dlg.own.isChecked() and not dlg.form.isRowVisible(dlg.own_row)
+    dlg.own.setChecked(True)  # starts from the group's times
+    assert (dlg.own_start.value(), dlg.own_end.value()) == (time(8, 0), time(14, 45))
+    dlg.own_start.set_value(time(9, 0))
+    dlg.own_end.set_value(time(14, 0))
+    assert dlg.own_hint.text() == "لا تأخير حتى 09:30 • غياب بعد 10:00 • الخروج من 13:45"
+    dlg.save()
+    e = db.employees.get(eid)
+    assert (e["own_start"], e["own_end"]) == ("09:00", "14:00")
+    again = employees.EmployeeDialog(window.ctx, eid, window)  # the saved times are kept on opening
+    assert again.own.isChecked() and (again.own_start.value(), again.own_end.value()) == (time(9, 0), time(14, 0))
+    again.own.setChecked(False)
+    again.save()
+    assert db.employees.get(eid)["own_start"] is None

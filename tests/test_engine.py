@@ -478,3 +478,54 @@ def test_general_holidays_do_not_stop_guard_rotations(duty_org):
     duty_org.holidays = [E.Holiday(2, "عطلة الحرس", date(2026, 10, 27), date(2026, 10, 27),
                                    frozenset({1}))]
     assert week(guard(["2026-10-25 08:00", "2026-11-01 08:00"]), duty_org)[2].status == E.HOLIDAY
+
+
+# ---------------------------------------------------------------- exit window, personal times
+@pytest.fixture
+def window_org():
+    # exit punches count from 14:30; 14:30-14:45 is an early exit, 14:45 on is on time
+    return org_with(strict(exit_window=15), group_sched={1: [(1, date(2020, 1, 1))]})
+
+
+def test_exit_window(window_org):
+    r = one_day(day("08:00", "14:50"), window_org, SUN)
+    assert (r.status, r.early, r.check_out) == (E.PRESENT, 0, datetime(2026, 10, 25, 14, 50))
+    r = one_day(day("08:00", "14:35"), window_org, SUN)
+    assert (r.status, r.early) == (E.PRESENT, 10) and r.label == "خروج مبكر"
+    # Before 14:30 a punch is not an exit: it does not count, and nobody punched out.
+    r = one_day(day("08:00", "11:00"), window_org, SUN)
+    assert r.check_out is None and "early_punch" in r.flags and r.status == E.ABSENT
+    assert "missing_out" in r.flags
+    r = one_day(day("08:00", "11:00", "14:46"), window_org, SUN)
+    assert r.status == E.PRESENT and r.check_out == datetime(2026, 10, 25, 14, 46) and r.worked == 406
+    still_working = one_day(day("08:00", "11:00"), window_org, SUN, now=datetime(2026, 10, 25, 12, 0))
+    assert still_working.status == E.PRESENT and "at_work" in still_working.flags
+
+
+def test_exit_window_and_explicit_exits(window_org):
+    # An exit entered by hand as «out» before the window is still an exit: an absence by the rules.
+    e = emp(leaves=())
+    e.punches = [E.Punch(1, datetime(2026, 10, 25, 8, 0)), E.Punch(2, datetime(2026, 10, 25, 12, 0), "out")]
+    r = one_day(e, window_org, SUN)
+    assert r.status == E.ABSENT and "absent_early" in r.flags
+    # An hourly leave at the end of the day moves the window with it.
+    hourly = E.LeaveType(3, "زمنية", unit="hour")
+    e = emp(["2026-10-25 08:00", "2026-10-25 12:50"],
+            leaves=[E.Leave(1, hourly, SUN, SUN, T("13:00"), T("14:45"))])
+    r = one_day(e, window_org, SUN)
+    assert (r.status, r.early) == (E.PRESENT, 10)
+
+
+def test_personal_times(window_org):
+    e = emp(["2026-10-25 09:20", "2026-10-25 13:50"])
+    e.own_start, e.own_end = T("09:00"), T("14:00")
+    r = one_day(e, window_org, SUN)
+    assert r.shift.start == datetime(2026, 10, 25, 9, 0) and r.shift.end == datetime(2026, 10, 25, 14, 0)
+    assert (r.status, r.late, r.early) == (E.PRESENT, 0, 10)  # on time until 09:30; exits from 13:45
+    e.punches = [E.Punch(1, datetime(2026, 10, 25, 10, 5))]
+    assert one_day(e, window_org, SUN).status == E.ABSENT  # absent after 10:00 for this person
+    only_exit = emp(["2026-10-25 08:00", "2026-10-25 13:00"])
+    only_exit.own_end = T("13:00")
+    assert one_day(only_exit, window_org, SUN).status == E.PRESENT
+    # the group's schedule itself is unchanged
+    assert one_day(emp(["2026-10-25 08:00", "2026-10-25 13:00"]), window_org, SUN).status == E.ABSENT

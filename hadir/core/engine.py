@@ -23,8 +23,12 @@ Key rules
   a missing check-in/check-out (``missing_absent``) make the day an absence.
   ``exit_until`` is the last time an exit punch is accepted; a missing
   check-out is final only after it.
+* With an ``exit_window`` only punches from that many minutes before the exit
+  time are exits; earlier punches after the check-in are not counted, and an
+  exit inside the window is an early exit (never an absence).
 * An employee may have a personal ``cycle_start``: their own first duty day on
-  a rotation (cycle) schedule, so teams of one group can take turns.
+  a rotation (cycle) schedule, so teams of one group can take turns, and their
+  own start and exit times (``own_start``/``own_end``) on working days.
 * On a ``continuous`` schedule consecutive duty days are one duty (for
   example a week on guard): one punch when joining and one at the end.  Each
   day of it still gets its own record: on duty, absent before joining or after
@@ -74,6 +78,7 @@ FLAG_LABELS = {
     "absent_late": "حضر بعد وقت الغياب",
     "absent_early": "خرج قبل وقت الخروج",
     "on_duty": "في النوبة",
+    "early_punch": "بصمة قبل وقت الخروج لم تُحتسب",
 }
 
 # Why a day with punches still counts as an absence, in the order they are reported.
@@ -119,6 +124,8 @@ class Schedule:
     early_absent: bool = False  # leaving before the exit time is an absence, not an early leave
     missing_absent: bool = False  # a missing check-in or check-out makes the day an absence
     continuous: bool = False  # consecutive duty days are one duty: punch on joining and at the end
+    exit_window: int = 0  # minutes before the exit time from which a punch is an exit (0 = any time)
+    personal_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     def rule_for(self, d: date) -> DayRule | None:
         if not self.days:
@@ -138,11 +145,19 @@ class Schedule:
             end += timedelta(days=1)
         return Shift(d, start, end)
 
-    def with_anchor(self, anchor: date | None) -> Schedule:
-        """The same rotation started on another day (an employee's own first duty day)."""
-        if self.kind != "cycle" or anchor is None or anchor == self.cycle_anchor:
+    def personal(self, anchor: date | None = None, start: time | None = None,
+                 end: time | None = None) -> Schedule:
+        """The schedule as one employee works it: own first duty day, own start and exit times."""
+        key = (anchor if self.kind == "cycle" and anchor != self.cycle_anchor else None, start, end)
+        if key == (None, None, None):
             return self
-        return replace(self, cycle_anchor=anchor)
+        if key not in self.personal_cache:
+            days = self.days
+            if start or end:
+                days = tuple(DayRule(True, start or r.start, end or r.end) if r.workday else r for r in days)
+            self.personal_cache[key] = replace(self, days=days, cycle_anchor=key[0] or self.cycle_anchor,
+                                               personal_cache={})
+        return self.personal_cache[key]
 
     def block_for(self, d: date) -> Block | None:
         """On a continuous schedule, the run of consecutive duty days around ``d``."""
@@ -280,6 +295,8 @@ class EmployeeData:
     leaves: list[Leave] = field(default_factory=list)
     punches: list[Punch] = field(default_factory=list)
     cycle_start: date | None = None  # own first duty day on a rotation schedule
+    own_start: time | None = None  # own start time on working days
+    own_end: time | None = None  # own exit time on working days
 
     def active_on(self, d: date) -> bool:
         if self.hire_date and d < self.hire_date:
@@ -310,7 +327,7 @@ class OrgData:
         if best is None and group_id is not None:
             best = _latest(a for a in self.group_assignments.get(group_id, ()) if a.covers(d))
         schedule = self.schedules.get(best.schedule_id) if best else None
-        return schedule.with_anchor(emp.cycle_start) if schedule else None
+        return schedule.personal(emp.cycle_start, emp.own_start, emp.own_end) if schedule else None
 
 
 def _latest(items):
@@ -537,8 +554,18 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     shift_over = now is None or now >= (shift.end if shift is not None else slot.we)
     _punch_flags(rec, org)
 
+    hourly = _hourly_intervals(emp.leaves, shift, d)
+    exit_from = _exit_from(schedule, shift, hourly)
     # check-in / check-out
-    if len(punches) >= 2:
+    if len(punches) >= 2 and exit_from is not None:
+        rec.check_in = punches[0].ts
+        exits = _exits(punches, exit_from)
+        if len(exits) < len(punches) - 1:
+            rec.flags.add("early_punch")
+        if exits:
+            rec.check_out = exits[-1].ts
+            rec.worked = minutes_between(rec.check_in, rec.check_out)
+    elif len(punches) >= 2:
         rec.check_in, rec.check_out = punches[0].ts, punches[-1].ts
         if len(punches) % 2 == 0:
             rec.worked = sum(minutes_between(punches[i].ts, punches[i + 1].ts)
@@ -562,7 +589,6 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     full_leave = day_leaves[0] if day_leaves else None
     rotation = schedule is not None and schedule.kind == "cycle"
     holiday = next((h for h in org.holidays if h.applies(d, group_id, rotation)), None)
-    hourly = _hourly_intervals(emp.leaves, shift, d)
     rec.hourly_leaves = [h[2] for h in hourly]
 
     if not emp.active_on(d):
@@ -640,13 +666,11 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     deadline = schedule.exit_deadline(shift)
     exit_closed = now is None or now >= (deadline or shift.end)
     if rec.check_out is not None:
-        eff_end = shift.end
-        grace = timedelta(minutes=schedule.grace_early)
-        for s, e, _ in sorted(hourly, key=lambda x: x[1], reverse=True):
-            if e >= eff_end - grace and s < eff_end:
-                eff_end = s
-        if rec.check_out < eff_end - grace:
-            if schedule.early_absent:
+        eff_end = _effective_end(schedule, shift, hourly)
+        if rec.check_out < eff_end - timedelta(minutes=schedule.grace_early):
+            # Inside the exit window leaving is an early exit; before it, the rule decides.
+            in_window = exit_from is not None and rec.check_out >= exit_from
+            if schedule.early_absent and not in_window:
                 absence.append("absent_early")
             else:
                 rec.early = minutes_between(rec.check_out, eff_end)
@@ -668,6 +692,37 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     return rec
 
 
+def _effective_end(schedule: Schedule, shift: Shift, hourly) -> datetime:
+    """The exit time, moved earlier by an hourly leave at the end of the day."""
+    eff_end = shift.end
+    grace = timedelta(minutes=schedule.grace_early)
+    for s, e, _ in sorted(hourly, key=lambda x: x[1], reverse=True):
+        if e >= eff_end - grace and s < eff_end:
+            eff_end = s
+    return eff_end
+
+
+def _exit_from(schedule: Schedule | None, shift: Shift | None, hourly) -> datetime | None:
+    """From when a punch is an exit (None: at any time)."""
+    if schedule is None or shift is None or not schedule.exit_window:
+        return None
+    return _effective_end(schedule, shift, hourly) - timedelta(minutes=schedule.exit_window)
+
+
+def _exits(punches: list, exit_from: datetime) -> list:
+    """Punches after the check-in that are exits: from ``exit_from`` on, or entered as «out»."""
+    return [p for p in punches[1:] if p.kind == "out" or p.ts >= exit_from]
+
+
+def exit_opens(rec: DayRecord) -> datetime | None:
+    """From when an exit punch counts on this day (None: at any time)."""
+    if rec.schedule is None or rec.shift is None or not rec.schedule.exit_window:
+        return None
+    block = rec.schedule.block_for(rec.date)
+    shift = block.shift if block is not None else rec.shift
+    return _exit_from(rec.schedule, shift, [(*lv.interval(), lv) for lv in rec.hourly_leaves])
+
+
 def _punch_flags(rec: DayRecord, org: OrgData) -> None:
     for p in rec.punches:
         if p.source != "face":
@@ -685,9 +740,15 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
     block, shift = slot.block, slot.shift
     punches = sorted(slot.punches, key=lambda p: p.ts)
     today = now.date() if now else None
+    hourly = _hourly_intervals(emp.leaves, shift, block.first)
+    exit_from = _exit_from(schedule, shift, hourly)
     check_in = check_out = None
+    ignored: set[int] = set()  # punches during the duty that were too early to be its end
     if len(punches) >= 2:
-        check_in, check_out = punches[0].ts, punches[-1].ts
+        check_in = punches[0].ts
+        exits = punches[1:] if exit_from is None else _exits(punches, exit_from)
+        ignored = {p.id for p in punches[1:] if p not in exits}
+        check_out = exits[-1].ts if exits else None
     elif punches:
         p = punches[0]
         over = now is None or now >= shift.end
@@ -698,7 +759,6 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
             check_in = p.ts
 
     # joining: rules as for a normal day, measured from the start of the duty
-    hourly = _hourly_intervals(emp.leaves, shift, block.first)
     grace = timedelta(minutes=schedule.grace_late)
     eff_start = shift.start
     for s, e, _ in hourly:
@@ -712,13 +772,10 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
         elif check_in > eff_start + grace:
             base = eff_start + grace if schedule.late_after_grace else eff_start
             late = minutes_between(base, check_in)
-    # leaving: at the end of the last day
-    eff_end = shift.end
-    grace_early = timedelta(minutes=schedule.grace_early)
-    for s, e, _ in sorted(hourly, key=lambda x: x[1], reverse=True):
-        if e >= eff_end - grace_early and s < eff_end:
-            eff_end = s
-    left_early = check_out is not None and check_out < eff_end - grace_early
+    # leaving: at the end of the last day; inside the exit window it is an early exit
+    eff_end = _effective_end(schedule, shift, hourly)
+    left_early = check_out is not None and check_out < eff_end - timedelta(minutes=schedule.grace_early)
+    in_window = exit_from is not None and check_out is not None and check_out >= exit_from
     overtime = 0
     if check_out is not None and check_out > shift.end:
         extra = minutes_between(shift.end, check_out)
@@ -748,6 +805,8 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
                                  shift=Shift(d, s, e), punches=by_piece.get(i, []))
         rec.required = minutes_between(s, e)
         _punch_flags(rec, org)
+        if any(p.id in ignored for p in rec.punches):
+            rec.flags.add("early_punch")
         day_leave = next((lv for lv in emp.leaves if not lv.hourly and lv.start <= d <= lv.end), None)
         holiday = next((h for h in org.holidays if h.applies(d, group_id, schedule.kind == "cycle")), None)
         on_duty = join is not None and join <= i and (leaving is None or i <= leaving)
@@ -792,7 +851,7 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
             if i == leaving:
                 rec.check_out = check_out
                 if left_early:
-                    if schedule.early_absent:
+                    if schedule.early_absent and not in_window:
                         absence.append("absent_early")
                     else:
                         rec.early = minutes_between(check_out, min(e, eff_end))
