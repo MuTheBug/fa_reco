@@ -1,36 +1,9 @@
-﻿; Inno Setup script — builds HadirSetup-<version>.exe
-; iscc packaging\installer.iss /DAppVersion=1.3.0
-#ifndef AppVersion
-  #define AppVersion "1.3.0"
-#endif
+﻿; Inno Setup script — builds HadirSetup-<version>.exe, the full installer
+; iscc packaging\installer.iss /DAppVersion=1.3.1
+#include "common.iss"
 
 [Setup]
-AppId={{6B0F6D5C-3C1B-4A7E-9F4B-2D8E1A9C7F21}
-AppName=حاضر — نظام الحضور ببصمة الوجه
-AppVersion={#AppVersion}
-AppPublisher=حاضر
-DefaultDirName={autopf}\Hadir
-DefaultGroupName=حاضر
-DisableProgramGroupPage=yes
-OutputDir=..\dist
 OutputBaseFilename=HadirSetup-{#AppVersion}
-SetupIconFile=..\hadir\resources\icons\hadir.ico
-UninstallDisplayIcon={app}\Hadir.exe
-Compression=lzma2/max
-SolidCompression=yes
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
-PrivilegesRequired=admin
-WizardStyle=modern
-MinVersion=10.0
-ShowLanguageDialog=no
-
-[Languages]
-#if FileExists(CompilerPath + "Languages\Arabic.isl")
-Name: "arabic"; MessagesFile: "compiler:Languages\Arabic.isl"
-#else
-Name: "english"; MessagesFile: "compiler:Default.isl"
-#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "إنشاء اختصار على سطح المكتب"
@@ -40,8 +13,14 @@ Name: "autostart"; Description: "تشغيل شاشة الحضور تلقائيا
 ; attendance data is shared by all Windows accounts on the kiosk computer
 Name: "{commonappdata}\Hadir"; Permissions: users-modify
 
+[InstallDelete]
+; a clean copy of the program's libraries: nothing left of an earlier version or of a failed copy
+; (the data is in ProgramData\Hadir, not here)
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
-Source: "..\dist\Hadir\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; dist\Hadir holds hadir-files.txt too: the SHA-256 of every file, as built
+Source: "..\dist\Hadir\*"; DestDir: "{app}"; Excludes: "portable.txt"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\حاضر — شاشة الحضور"; Filename: "{app}\Hadir.exe"
@@ -52,6 +31,13 @@ Name: "{autodesktop}\حاضر"; Filename: "{app}\Hadir.exe"; Tasks: desktopicon
 Name: "{commonstartup}\حاضر"; Filename: "{app}\Hadir.exe"; Tasks: autostart
 
 [Run]
-Filename: "{app}\Hadir.exe"; Description: "تشغيل حاضر الآن"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Hadir.exe"; Description: "تشغيل حاضر الآن"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 ; The attendance database in ProgramData\Hadir is intentionally kept on uninstall.
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopHadir();
+  Result := '';
+end;
