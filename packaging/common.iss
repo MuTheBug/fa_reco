@@ -2,7 +2,7 @@
 ; identity, so that both install into the same place and keep one uninstaller, and the code that
 ; closes Hadir before its files are replaced or removed.
 #ifndef AppVersion
-  #define AppVersion "1.3.1"
+  #define AppVersion "1.4.0"
 #endif
 
 [Setup]

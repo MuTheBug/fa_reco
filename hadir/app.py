@@ -117,6 +117,14 @@ def run_gui(args) -> int:
     sender.start()
     ctx = AppContext(db, camera, worker, telegram=sender)
     win = MainWindow(ctx, kiosk_first=bool(s["kiosk.start_in_kiosk"]) and not args.admin)
+
+    def relaunch():
+        """Start a new copy of the program, then quit (when the camera driver is stuck)."""
+        lock.unlock()
+        start_again()
+        app.quit()
+
+    win.relaunch = relaunch
     win.start()
     if args.admin:
         win.in_kiosk = True
@@ -127,10 +135,23 @@ def run_gui(args) -> int:
     return code
 
 
+def start_again() -> None:
+    """Start the program again with the same arguments, independent of this process."""
+    import subprocess
+
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, *sys.argv[1:]]
+    else:
+        cmd = [sys.executable, "-m", "hadir", *sys.argv[1:]]
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # a new instance, not a child
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(cmd, env=env, close_fds=True, creationflags=flags)
+
+
 def selftest(args) -> int:
     """Headless check used by the Windows build: models, database, reports."""
     import tempfile
-    from datetime import date
+    from datetime import date, datetime, time
 
     import cv2
     import numpy as np
@@ -189,6 +210,18 @@ def selftest(args) -> int:
             export_xlsx(rep, str(Path(tmp) / f"{rid}.xlsx"))
             pages = export_pdf(rep, str(Path(tmp) / f"{rid}.pdf"))
             out.append(f"report {rid}: {pages} page(s)")
+        # the Telegram summary is drawn with Qt and the bundled fonts
+        try:
+            from .notify import card, summary
+
+            s = summary.day_summary(db, date(2026, 10, 28), time(9, 5), now=datetime(2026, 10, 28, 9, 5))
+            png = card.render(s)
+            out.append(f"telegram summary picture: {len(png)} bytes, {s.total.present} of {s.total.due} present")
+            if args.selftest_out:
+                Path(args.selftest_out).with_name("selftest-summary.png").write_bytes(png)
+        except Exception:
+            out.append(traceback.format_exc())
+            code = 5
         # the admin pages are imported by name when first opened: open each one in this build
         try:
             out.append(f"admin pages: {open_every_page(db)} opened")

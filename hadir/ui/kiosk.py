@@ -17,7 +17,7 @@ from ..kiosk_logic import KioskResult
 from .sound import play
 from .theme import C, FONT_FAMILY, icon, pixmap
 from .widgets.camera_view import CameraView
-from .widgets.common import error
+from .widgets.common import AlertBar, error
 
 TONE_COLORS = {"ok": "#16a34a", "warn": "#d97706", "bad": "#dc2626"}
 
@@ -143,6 +143,8 @@ class KioskScreen(QWidget):
         clock_box.addWidget(self.date)
         hl.addLayout(clock_box)
         root.addWidget(head)
+        self.alert = AlertBar()  # e.g. Telegram reports waiting for the internet
+        root.addWidget(self.alert)
 
         # body
         body = QWidget()
@@ -257,9 +259,12 @@ class KioskScreen(QWidget):
     def _pull_frame(self):
         cam = self.ctx.camera
         frame, seq = cam.latest()
-        if cam.state == "error" and frame is None:
-            self.camera.placeholder = cam.error
-            self.camera.set_frame(None)
+        if frame is None:
+            text = cam.error or "جارٍ تشغيل الكاميرا…"
+            if text != self.camera.placeholder or self._last_seq != -1:
+                self.camera.placeholder = text
+                self.camera.set_frame(None)
+                self._last_seq = -1
             return
         if seq != self._last_seq and frame is not None:
             self._last_seq = seq

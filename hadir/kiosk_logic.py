@@ -17,7 +17,7 @@ from .paths import snapshots_dir
 
 @dataclass
 class KioskResult:
-    kind: str  # punched | duplicate | early | closed | unknown | spoof | ambiguous | inactive | error
+    kind: str  # punched | duplicate | left | early | closed | unknown | spoof | ambiguous | inactive | error
     tone: str  # ok | warn | bad
     title: str
     lines: list = field(default_factory=list)
@@ -133,7 +133,16 @@ class KioskLogic:
                                    [f"آخر تسجيل قبل {digits(mins)} دقيقة الساعة {fmt_time(parse_dt(last['ts']))}"],
                                    employee_id, emp["full_name"], emp["code"], ts=ts)
         [data] = self.db.load_employees([employee_id], ts.date() - timedelta(days=1), ts.date())
-        punch_type, rec = E.classify_new_punch(data, self.db.load_org(), ts)
+        org = self.db.load_org()
+        punch_type, rec = E.classify_new_punch(data, org, ts)
+        left = E.left_at(data, org, rec, ts)
+        if left is not None:
+            # Already left for the day: passing the camera again records nothing.
+            duty = duty_block(rec) is not None
+            return KioskResult("left", "warn", "انتهاء نوبتك مسجّل" if duty else "انصرافك مسجّل اليوم",
+                               [f"سُجّل {'انتهاء النوبة' if duty else 'انصرافك'} الساعة {fmt_time(left)}",
+                                "لا حاجة إلى بصمة أخرى"],
+                               employee_id, emp["full_name"], emp["code"], ts=ts)
         deadline = rec.schedule.exit_deadline(rec.shift) if rec.schedule and rec.shift else None
         if deadline is not None and ts > deadline:
             # No punches once the day's last exit time has passed; the admin sees the attempt.
@@ -149,7 +158,8 @@ class KioskLogic:
             # After the check-in, a punch before the exit window is not an exit: nothing is recorded.
             return KioskResult("early", "warn", "لم يحن وقت الخروج بعد",
                                [f"حضورك مسجّل الساعة {fmt_time(rec.check_in)}",
-                                f"تُقبل بصمة الخروج من الساعة {fmt_time(opens)}"],
+                                f"تُقبل بصمة الخروج من الساعة {fmt_time(opens)}",
+                                "المغادر بإجازة ساعية لا يحتاج إلى بصمة: تكفي الإجازة المسجّلة في البرنامج"],
                                employee_id, emp["full_name"], emp["code"], ts=ts)
         snap = self._snapshot(frame, box, ts, f"{emp['code']}")
         if source == "face":

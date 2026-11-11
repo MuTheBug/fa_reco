@@ -407,4 +407,13 @@ MIGRATIONS: list = [
     UPDATE schedules SET exit_window = 15
     WHERE name = 'الدوام الرسمي' AND grace_late = 30 AND absent_after = 60 AND exit_until = '17:00';
     """,
+    # 5 -- the Telegram report becomes a picture of the day's numbers (no names)
+    """
+    ALTER TABLE outbox ADD COLUMN photo BLOB;
+    ALTER TABLE outbox ADD COLUMN day TEXT;
+    -- With many employees a message per punch was too many: the summary replaces them.
+    UPDATE settings SET value = 'false' WHERE key = 'telegram.punches';
+    -- Reports by name that were still waiting are not sent any more.
+    UPDATE outbox SET dropped = 1 WHERE sent_at IS NULL AND dropped = 0;
+    """,
 ]

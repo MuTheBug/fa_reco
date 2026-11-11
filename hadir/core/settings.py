@@ -53,8 +53,8 @@ DEFAULTS: dict = {
     "telegram.enabled": False,
     "telegram.token": "",
     "telegram.chat_id": "",
-    "telegram.punches": True,  # a message for every check-in and check-out
-    "telegram.daily_list": True,  # the attendance report: who came and who did not, by group
+    "telegram.punches": False,  # a message for every check-in and check-out (too many for most)
+    "telegram.daily_list": True,  # the summary of the day as a picture: numbers by group, no names
     "telegram.daily_time": "09:05، 17:05",  # one or more times of day
 }
 

@@ -535,13 +535,33 @@ class Toast(QLabel):
     def show_text(self, text: str, ms: int = 2600, tone: str = "") -> None:
         bg = {"bad": C["bad"], "ok": C["ok"], "warn": C["warn"]}.get(tone, C["navy"])
         self.setStyleSheet(f"background: {bg}; color: white; border-radius: 10px; padding: 10px 18px;")
+        p = self.parentWidget()
+        self.setWordWrap(len(text) > 80)
+        self.setMaximumWidth(max(320, int(p.width() * 0.8)))
         self.setText(text)
         self.adjustSize()
-        p = self.parentWidget()
         self.move((p.width() - self.width()) // 2, p.height() - self.height() - 28)
         self.raise_()
         self.show()
         self._timer.start(ms)
+
+
+class AlertBar(QLabel):
+    """A strip across the screen with something that needs attention (hidden when empty)."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("AlertBar")
+        self.setWordWrap(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("#AlertBar { background: #fef3c7; color: #92400e; border-bottom: 2px solid #f59e0b;"
+                           " padding: 10px 18px; font-size: 13pt; font-weight: bold; }")
+        self.hide()
+
+    def set_text(self, text: str) -> None:
+        if text != self.text():
+            self.setText(f"⚠  {text}" if text else "")
+        self.setVisible(bool(text))
 
 
 def hline() -> QFrame:

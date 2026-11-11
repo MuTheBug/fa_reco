@@ -235,3 +235,46 @@ def test_personal_times_in_the_employee_form(window, qapp):
     again.own.setChecked(False)
     again.save()
     assert db.employees.get(eid)["own_start"] is None
+
+
+def test_reports_waiting_for_the_internet_are_shown_on_screen(window, qapp):
+    from datetime import timedelta
+
+    db = window.ctx.db
+    window.start()
+    assert window.show_alerts() == "" and not window.kiosk.alert.isVisibleTo(window.kiosk)
+    db.settings.set_many({"telegram.enabled": True, "telegram.token": "123:ABC", "telegram.chat_id": "-100"})
+    mid = db.outbox.add("report", "ملخص", day=db.now().date().isoformat())
+    db.x("UPDATE outbox SET created_at = ?, attempts = 2, last_error = ? WHERE id = ?",
+         ((db.now() - timedelta(hours=1)).isoformat(sep=" ", timespec="seconds"),
+          "تعذّر الاتصال بتلغرام: تأكد من اتصال الجهاز بالإنترنت.", mid))
+    window.in_kiosk = True
+    text = window.show_alerts()
+    assert "صِل الجهاز بالإنترنت" in text
+    assert window.kiosk.alert.isVisibleTo(window.kiosk) and window.admin.alert.isVisibleTo(window.admin)
+    assert window.toaster.isVisibleTo(window) and "الإنترنت" in window.toaster.text()
+    window.toaster.hide()
+    window.show_alerts()
+    assert not window.toaster.isVisibleTo(window)  # repeated in large letters only every half hour
+    db.outbox.mark_sent(mid)
+    assert window.show_alerts() == "" and not window.kiosk.alert.isVisibleTo(window.kiosk)
+
+
+def test_summary_preview_shows_the_picture(window, qapp, monkeypatch):
+    from datetime import time
+
+    from hadir.notify import card, summary
+    from hadir.ui.pages import settings
+
+    db = window.ctx.db
+    s = summary.day_summary(db, date(2026, 10, 27), time(9, 5))
+    dlg = settings.SummaryPreview(card.render(s), summary.caption(s), window)
+    assert not dlg.image.pixmap().isNull() and "ملخص الدوام" in dlg.caption.text()
+    dlg.close()
+    window.start()
+    window.admin.show_page("settings")
+    page = window.admin.pages["settings"]
+    monkeypatch.setattr(settings, "info", lambda *a, **k: None)
+    page._tg_show_preview()  # today's summary (or a note that nobody works today)
+    if getattr(page, "preview", None) is not None:
+        page.preview.close()

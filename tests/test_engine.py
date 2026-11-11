@@ -516,6 +516,53 @@ def test_exit_window_and_explicit_exits(window_org):
     assert (r.status, r.early) == (E.PRESENT, 10)
 
 
+def test_a_punch_after_leaving_is_not_a_second_exit(window_org):
+    # left at 14:50, passed the camera again at 15:50: the day still ends at 14:50 (no overtime)
+    r = one_day(day("08:00", "14:50", "15:50"), window_org, SUN)
+    assert (r.status, r.check_out, r.overtime, r.worked) == (E.PRESENT, datetime(2026, 10, 25, 14, 50), 0, 410)
+    assert "extra_punch" in r.flags
+    # an early exit can still be followed by the real one
+    r = one_day(day("08:00", "14:35", "14:50"), window_org, SUN)
+    assert (r.check_out, r.early) == (datetime(2026, 10, 25, 14, 50), 0) and "extra_punch" not in r.flags
+
+
+def test_left_at_tells_the_kiosk_the_day_is_over(window_org):
+    later = datetime(2026, 10, 25, 15, 50)
+    for punches, left in ((("08:00", "14:50"), datetime(2026, 10, 25, 14, 50)),
+                          (("08:00", "14:35"), None),  # an early exit can be replaced
+                          (("08:00",), None)):
+        e = day(*punches)
+        _, rec = E.classify_new_punch(e, window_org, later)
+        assert E.left_at(e, window_org, rec, later) == left
+    # with an hourly leave until the end of the day, leaving at its start ends the day
+    hourly = E.LeaveType(3, "زمنية", unit="hour")
+    e = emp(["2026-10-25 08:00", "2026-10-25 13:00"], leaves=[E.Leave(1, hourly, SUN, SUN, T("13:00"), T("15:00"))])
+    _, rec = E.classify_new_punch(e, window_org, later)
+    assert E.left_at(e, window_org, rec, later) == datetime(2026, 10, 25, 13, 0)
+
+
+def test_hourly_leave_until_the_end_needs_no_exit_punch(window_org):
+    hourly = E.LeaveType(3, "زمنية", unit="hour")
+    leave = [E.Leave(1, hourly, SUN, SUN, T("13:00"), T("15:00"))]  # left at 13:00 for two hours
+    r = one_day(emp(["2026-10-25 08:00"], leaves=leave), window_org, SUN)
+    assert r.status == E.PRESENT and "left_on_leave" in r.flags and "missing_out" not in r.flags
+    assert r.worked == 300 and r.label == "غادر بإجازة ساعية"
+    during = one_day(emp(["2026-10-25 08:00"], leaves=leave), window_org, SUN, now=datetime(2026, 10, 25, 13, 30))
+    assert during.status == E.PRESENT and "left_on_leave" in during.flags and "at_work" not in during.flags
+    # a leave that ends before the exit time still needs the exit punch
+    short = [E.Leave(1, hourly, SUN, SUN, T("12:00"), T("13:00"))]
+    r = one_day(emp(["2026-10-25 08:00"], leaves=short), window_org, SUN)
+    assert r.status == E.ABSENT and "missing_out" in r.flags
+    # and not coming at all is still an absence
+    assert one_day(emp(leaves=leave), window_org, SUN).status == E.ABSENT
+
+
+def test_weekly_duty_ignores_a_punch_after_its_end(duty_org):
+    days = week(guard(["2026-10-25 07:55", "2026-11-01 08:10", "2026-11-01 09:30"]), duty_org)
+    assert days[6].check_out == datetime(2026, 11, 1, 8, 10) and "extra_punch" in days[6].flags
+    assert days[6].overtime == 0 and [d.status for d in days[:7]] == [E.PRESENT] * 7
+
+
 def test_personal_times(window_org):
     e = emp(["2026-10-25 09:20", "2026-10-25 13:50"])
     e.own_start, e.own_end = T("09:00"), T("14:00")

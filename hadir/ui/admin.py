@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushB
 from .. import APP_TITLE
 from ..core.security import ROLES, can
 from .theme import icon
-from .widgets.common import Toast
+from .widgets.common import AlertBar, Toast
 
 # key, Arabic title, icon, module:class, permission
 PAGES = [
@@ -105,8 +105,15 @@ class AdminShell(QWidget):
         sl.addWidget(out)
         lay.addWidget(side)
 
+        main = QWidget()
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(0)
+        self.alert = AlertBar()  # e.g. Telegram reports waiting for the internet
+        ml.addWidget(self.alert)
         self.stack = QStackedWidget()
-        lay.addWidget(self.stack, 1)
+        ml.addWidget(self.stack, 1)
+        lay.addWidget(main, 1)
         self.pages: dict[str, Page] = {}
         self.current: str | None = None
         self.toaster = Toast(self)

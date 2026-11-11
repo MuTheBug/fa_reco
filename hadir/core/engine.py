@@ -79,6 +79,8 @@ FLAG_LABELS = {
     "absent_early": "خرج قبل وقت الخروج",
     "on_duty": "في النوبة",
     "early_punch": "بصمة قبل وقت الخروج لم تُحتسب",
+    "extra_punch": "بصمة بعد الانصراف لم تُحتسب",
+    "left_on_leave": "غادر بإجازة ساعية",
 }
 
 # Why a day with punches still counts as an absence, in the order they are reported.
@@ -399,6 +401,8 @@ class DayRecord:
                 parts.append(FLAG_LABELS["missing_out"])
             if "missing_in" in self.flags:
                 parts.append(FLAG_LABELS["missing_in"])
+            if "left_on_leave" in self.flags:
+                parts.append(FLAG_LABELS["left_on_leave"])
             if "on_duty" in self.flags and not parts:
                 parts.append(FLAG_LABELS["on_duty"])
             if "at_work" in self.flags and not parts:
@@ -563,7 +567,10 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
         if len(exits) < len(punches) - 1:
             rec.flags.add("early_punch")
         if exits:
-            rec.check_out = exits[-1].ts
+            out = _chosen_exit(exits, _on_time_exit(schedule, shift, hourly))
+            if out is not exits[-1]:
+                rec.flags.add("extra_punch")
+            rec.check_out = out.ts
             rec.worked = minutes_between(rec.check_in, rec.check_out)
     elif len(punches) >= 2:
         rec.check_in, rec.check_out = punches[0].ts, punches[-1].ts
@@ -665,8 +672,8 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
     # A check-out is still possible until the last exit time.
     deadline = schedule.exit_deadline(shift)
     exit_closed = now is None or now >= (deadline or shift.end)
+    eff_end = _effective_end(schedule, shift, hourly)
     if rec.check_out is not None:
-        eff_end = _effective_end(schedule, shift, hourly)
         if rec.check_out < eff_end - timedelta(minutes=schedule.grace_early):
             # Inside the exit window leaving is an early exit; before it, the rule decides.
             in_window = exit_from is not None and rec.check_out >= exit_from
@@ -678,6 +685,11 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
             extra = minutes_between(shift.end, rec.check_out)
             if extra >= schedule.overtime_min:
                 rec.overtime = extra
+    elif eff_end < shift.end and (exit_closed or now >= eff_end):
+        # On an hourly leave until the end of the day: no exit punch is needed.
+        rec.flags.add("left_on_leave")
+        if rec.check_in is not None and eff_end > rec.check_in:
+            rec.worked = minutes_between(rec.check_in, eff_end)
     elif exit_closed:
         rec.flags.add("missing_out")
         if schedule.missing_absent:
@@ -714,6 +726,34 @@ def _exits(punches: list, exit_from: datetime) -> list:
     return [p for p in punches[1:] if p.kind == "out" or p.ts >= exit_from]
 
 
+def _on_time_exit(schedule: Schedule, shift: Shift, hourly) -> datetime:
+    """From when leaving is not early (the exit time, or the start of a leave until the end)."""
+    return _effective_end(schedule, shift, hourly) - timedelta(minutes=schedule.grace_early)
+
+
+def _chosen_exit(exits: list, on_time: datetime):
+    """The exit that ends the day: the first one from the on-time exit time on, since a later
+    punch is someone passing the camera again; before that, the last (an early exit can still
+    be followed by the real one)."""
+    return next((p for p in exits if p.ts >= on_time), exits[-1])
+
+
+def left_at(emp: EmployeeData, org: OrgData, rec: DayRecord, ts: datetime) -> datetime | None:
+    """When the employee already left on the day (or duty) a punch at ``ts`` belongs to: an exit
+    made from the on-time exit time on, before ``ts``. A later punch would only be someone
+    passing the camera again. None if they have not left yet (or left early)."""
+    if rec.schedule is None or rec.shift is None:
+        return None
+    [before] = compute_days(emp, org, rec.date, rec.date, now=ts)
+    out = before.check_out
+    if out is None or out >= ts or (before.check_in is not None and out <= before.check_in):
+        return None
+    block = rec.schedule.block_for(rec.date)
+    shift = block.shift if block is not None else rec.shift
+    hourly = _hourly_intervals(emp.leaves, shift, block.first if block is not None else rec.date)
+    return out if out >= _on_time_exit(rec.schedule, shift, hourly) else None
+
+
 def exit_opens(rec: DayRecord) -> datetime | None:
     """From when an exit punch counts on this day (None: at any time)."""
     if rec.schedule is None or rec.shift is None or not rec.schedule.exit_window:
@@ -744,11 +784,15 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
     exit_from = _exit_from(schedule, shift, hourly)
     check_in = check_out = None
     ignored: set[int] = set()  # punches during the duty that were too early to be its end
+    passing: set[int] = set()  # punches after the duty had ended
     if len(punches) >= 2:
         check_in = punches[0].ts
         exits = punches[1:] if exit_from is None else _exits(punches, exit_from)
         ignored = {p.id for p in punches[1:] if p not in exits}
-        check_out = exits[-1].ts if exits else None
+        if exits:
+            out = _chosen_exit(exits, _on_time_exit(schedule, shift, hourly))
+            passing = {p.id for p in exits if p.ts > out.ts}
+            check_out = out.ts
     elif punches:
         p = punches[0]
         over = now is None or now >= shift.end
@@ -807,6 +851,8 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
         _punch_flags(rec, org)
         if any(p.id in ignored for p in rec.punches):
             rec.flags.add("early_punch")
+        if any(p.id in passing for p in rec.punches):
+            rec.flags.add("extra_punch")
         day_leave = next((lv for lv in emp.leaves if not lv.hourly and lv.start <= d <= lv.end), None)
         holiday = next((h for h in org.holidays if h.applies(d, group_id, schedule.kind == "cycle")), None)
         on_duty = join is not None and join <= i and (leaving is None or i <= leaving)
@@ -861,7 +907,9 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
                 if "absent_early" not in absence:
                     absence.append("absent_early")
         elif exit_closed:
-            if i == n - 1:
+            if i == n - 1 and eff_end < shift.end:  # on an hourly leave until the end of the duty
+                rec.flags.add("left_on_leave")
+            elif i == n - 1:
                 rec.flags.add("missing_out")
                 if schedule.missing_absent:
                     absence.append("missing_out")

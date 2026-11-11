@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 
 from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import QDialog, QMainWindow, QStackedWidget
 
 from .. import APP_SUBTITLE, APP_TITLE
 from ..core import maintenance
+from ..core.timeutil import parse_dt
 from ..face.service import purge_snapshots
 from ..kiosk_logic import KioskLogic
 from ..notify import telegram
@@ -42,6 +44,14 @@ class AppContext:
     def toast(self, text: str, tone: str = ""):
         if self.window is not None:
             self.window.toaster.show_text(text, tone=tone)
+
+
+# Without a single frame for this long after the camera had worked, and starting it again did not
+# help (a driver stuck since the computer slept), the program restarts itself; at most this often.
+RELAUNCH_AFTER_SECONDS = 120
+RELAUNCH_EVERY = timedelta(minutes=30)
+SLEEP_GAP_SECONDS = 30  # timers stop while the computer sleeps: a longer gap means it woke up
+ALERT_TOAST_SECONDS = 30 * 60  # how often the attendance screen repeats a waiting-reports alert
 
 
 class _ActivityFilter(QObject):
@@ -96,6 +106,12 @@ class MainWindow(QMainWindow):
         self._heartbeat.timeout.connect(self._housekeeping)
         self._heartbeat.start(60_000)
         QTimer.singleShot(5000, self._housekeeping)
+        self._wall = time.time()
+        self._camera_timer = QTimer(self)
+        self._camera_timer.timeout.connect(self._watch_camera)
+        self._camera_timer.start(2000)
+        self.relaunch = None  # set by the application: start a new copy of the program and quit
+        self._alert_toast_at = -ALERT_TOAST_SECONDS
         self._allow_close = False
         self.in_kiosk = kiosk_first
 
@@ -168,6 +184,39 @@ class MainWindow(QMainWindow):
 
         return QApplication.activeModalWidget() is not None
 
+    # --------------------------------------------------------------- camera
+    def _watch_camera(self) -> str:
+        """Keep the camera alive: after the laptop slept (its lid closed) the camera handle is
+        usually dead, so it is opened again; so is a camera whose frames stopped coming."""
+        now = time.time()
+        slept, self._wall = now - self._wall > SLEEP_GAP_SECONDS, now
+        cam = self.ctx.camera
+        if slept and cam.wanted:
+            cam.restart("the computer woke up")
+            return "resumed"
+        why = cam.watch()
+        if not why and self._should_relaunch():
+            self._relaunch_now()
+            return "relaunched"
+        return why
+
+    def _should_relaunch(self) -> bool:
+        if self.relaunch is None or not self.in_kiosk or self._modal_open():
+            return False
+        if self.ctx.camera.dead_for() < RELAUNCH_AFTER_SECONDS:
+            return False
+        db = self.ctx.db
+        last = db.settings.get("camera.last_relaunch") or ""
+        return not last or db.now() - parse_dt(last) >= RELAUNCH_EVERY
+
+    def _relaunch_now(self):
+        db = self.ctx.db
+        db.settings.set("camera.last_relaunch", db.now_s(), audit=False)
+        db.events.add("camera", "توقفت الكاميرا ولم تعد إلى العمل بعد إعادة فتحها؛ أُعيد تشغيل البرنامج تلقائياً")
+        self._allow_close = True
+        self._shutdown()
+        self.relaunch()
+
     # ---------------------------------------------------------- maintenance
     def _housekeeping(self):
         db = self.ctx.db
@@ -193,6 +242,21 @@ class MainWindow(QMainWindow):
                     self.ctx.telegram.wake()
         except Exception as exc:  # the attendance screen must keep working whatever happens here
             db.events.add("telegram", f"تعذّر إعداد تقرير الحضور: {exc}")
+        self.show_alerts()
+
+    def show_alerts(self) -> str:
+        """Reports held up (no internet) are shown on both screens, and every half hour the
+        attendance screen also says so in large letters."""
+        try:
+            text = telegram.waiting_alert(self.ctx.db, self.ctx.db.now())
+        except Exception:
+            text = ""
+        self.kiosk.alert.set_text(text)
+        self.admin.alert.set_text(text)
+        if text and self.in_kiosk and time.monotonic() - self._alert_toast_at >= ALERT_TOAST_SECONDS:
+            self._alert_toast_at = time.monotonic()
+            self.toaster.show_text(text, 20_000, "warn")
+        return text
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):

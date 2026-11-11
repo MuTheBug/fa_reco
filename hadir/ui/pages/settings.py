@@ -10,7 +10,7 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, QTimer, 
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QPushButton,
-                               QTabWidget, QVBoxLayout, QWidget)
+                               QScrollArea, QTabWidget, QVBoxLayout, QWidget)
 
 from ... import APP_SUBTITLE, APP_TITLE, __version__
 from ...core import maintenance
@@ -64,6 +64,36 @@ def combo(items: dict, value) -> QComboBox:
         c.addItem(v, k)
     c.setCurrentIndex(max(0, c.findData(value)))
     return c
+
+
+class SummaryPreview(QDialog):
+    """The summary exactly as it would reach Telegram: the picture and the text under it."""
+
+    def __init__(self, picture: bytes | None, caption: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("معاينة ملخص الدوام")
+        lay = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        box = QWidget()
+        bl = QVBoxLayout(box)
+        self.image = QLabel(alignment=Qt.AlignCenter)
+        pm = QPixmap()
+        if picture and pm.loadFromData(picture):
+            self.image.setPixmap(pm.scaledToWidth(560, Qt.SmoothTransformation))
+        else:
+            self.image.setText("تعذّر رسم الصورة؛ يُرسل النص وحده.")
+        bl.addWidget(self.image)
+        self.caption = QLabel(caption.replace("\n", "<br>"))
+        self.caption.setTextFormat(Qt.RichText)
+        self.caption.setWordWrap(True)
+        bl.addWidget(self.caption)
+        scroll.setWidget(box)
+        lay.addWidget(scroll, 1)
+        close = QPushButton("إغلاق")
+        close.clicked.connect(self.accept)
+        lay.addWidget(close, 0, Qt.AlignLeft)
+        self.resize(640, 760)
 
 
 class SettingsPage(Page):
@@ -224,10 +254,10 @@ class SettingsPage(Page):
         f = self._tab("تلغرام")
         outer = self.tabs.widget(self.tabs.count() - 1)._outer
         outer.insertWidget(0, label(
-            "يرسل البرنامج إلى مجموعة أو قناة تلغرام رسالة عند كل تسجيل حضور أو انصراف (الاسم والصفة"
-            " الوظيفية ووقت الدخول والخروج)، وقائمة يومية بأسماء الموظفين وحالاتهم. هذه الميزة وحدها تحتاج إلى"
-            " إنترنت: إن انقطع الاتصال تُحفظ الرسائل وتُرسل عند عودته، ويبقى تسجيل الحضور يعمل كالمعتاد.",
-            wrap=True))
+            "يرسل البرنامج إلى مجموعة أو قناة تلغرام ملخص الدوام في الساعات التي تحددها: صورة بالأعداد دون"
+            " أسماء (الحاضرون في الوقت والمتأخرون والغائبون وسبب الغياب والإجازات، لكل مجموعة). هذه الميزة وحدها"
+            " تحتاج إلى إنترنت: إن انقطع الاتصال يُحفظ الملخص ويُرسل عند عودته (حتى شهر)، وتنبّه الشاشة إلى"
+            " ضرورة الاتصال بالإنترنت، ويبقى تسجيل الحضور يعمل كالمعتاد.", wrap=True))
         W["telegram.enabled"] = QCheckBox("تفعيل إشعارات تلغرام")
         W["telegram.enabled"].setChecked(bool(s["telegram.enabled"]))
         f.addRow("", W["telegram.enabled"])
@@ -251,10 +281,11 @@ class SettingsPage(Page):
         row.addWidget(W["telegram.chat_id"], 1)
         row.addWidget(find)
         f.addRow("معرّف المجموعة أو القناة:", row)
-        W["telegram.punches"] = QCheckBox("رسالة عند كل تسجيل حضور أو انصراف")
+        W["telegram.punches"] = QCheckBox("رسالة باسم الموظف عند كل تسجيل حضور أو انصراف"
+                                          " (غير مستحسن مع كثرة الموظفين)")
         W["telegram.punches"].setChecked(bool(s["telegram.punches"]))
         f.addRow("", W["telegram.punches"])
-        W["telegram.daily_list"] = QCheckBox("تقرير الحضور (من حضر ومن لم يحضر، لكل مجموعة) في الساعات:")
+        W["telegram.daily_list"] = QCheckBox("ملخص الدوام (صورة بالأعداد دون أسماء) في الساعات:")
         W["telegram.daily_list"].setChecked(bool(s["telegram.daily_list"]))
         W["telegram.daily_time"] = QLineEdit(s["telegram.daily_time"])
         W["telegram.daily_time"].setPlaceholderText("09:05، 17:05")
@@ -266,11 +297,14 @@ class SettingsPage(Page):
         f.addRow("", row)
         self.tg_test = button("إرسال رسالة تجريبية", "send", "primary")
         self.tg_test.clicked.connect(self._tg_test)
-        self.tg_list = button("إرسال تقرير الحضور الآن", "report")
+        self.tg_list = button("إرسال ملخص الدوام الآن", "report")
         self.tg_list.clicked.connect(self._tg_send_list)
+        self.tg_preview = button("معاينة الملخص", "search")
+        self.tg_preview.clicked.connect(self._tg_show_preview)
         row = QHBoxLayout()
         row.addWidget(self.tg_test)
         row.addWidget(self.tg_list)
+        row.addWidget(self.tg_preview)
         row.addStretch(1)
         f.addRow("", row)
         self.tg_status = label("", "Hint", wrap=True)
@@ -396,6 +430,9 @@ class SettingsPage(Page):
         if frame is not None and seq != self._cam_seq:
             self._cam_seq = seq
             self.cam_view.set_frame(frame)
+        elif frame is None and self._cam_seq != -1:
+            self._cam_seq = -1
+            self.cam_view.set_frame(None)
 
     def _pick_backup_dir(self):
         d = QFileDialog.getExistingDirectory(self, "مجلد النسخ الاحتياطية")
@@ -405,9 +442,14 @@ class SettingsPage(Page):
     def refresh(self):
         self.rules_view.reload()
         self._tg_status()
-        privacy = ("إشعارات تلغرام مفعّلة: تُرسل أسماء الموظفين وصفاتهم وأوقات حضورهم إلى مجموعة تلغرام"
-                   " المحددة، ولا يُرسل غير ذلك." if telegram.enabled(self.db) else
-                   "لا تُرسل أي بيانات خارج هذا الجهاز.")
+        if not telegram.enabled(self.db):
+            privacy = "لا تُرسل أي بيانات خارج هذا الجهاز."
+        elif self.db.settings.get("telegram.punches"):
+            privacy = ("إشعارات تلغرام مفعّلة: يُرسل ملخص الدوام بالأعداد، ورسالة باسم الموظف وصفته وأوقاته"
+                       " عند كل تسجيل، إلى مجموعة تلغرام المحددة فقط.")
+        else:
+            privacy = ("إشعارات تلغرام مفعّلة: يُرسل ملخص الدوام بالأعداد دون أسماء إلى مجموعة تلغرام"
+                       " المحددة، ولا يُرسل غير ذلك.")
         self.about_lbl.setText(f"الإصدار {__version__} • يعمل دون إنترنت. {privacy}")
         last = self.db.settings.get("backup.last")
         self.last_backup.setText(digits(last[:16]) if last else "لم تُنشأ بعد")
@@ -506,7 +548,7 @@ class SettingsPage(Page):
             error(self, "أدخل رمز البوت ومعرّف المجموعة أولاً.")
             return
         text = (f"✅ رسالة تجريبية من برنامج «حاضر» — {self.w['org.name'].text().strip()}\n"
-                "ستصل إلى هنا إشعارات الحضور والانصراف.")
+                "سيصل إلى هنا ملخص الدوام في الساعات المحددة.")
         self.tg_test.setEnabled(False)
         run_in_background(self, lambda: telegram.send_message(token, chat, text), self._tg_test_done)
 
@@ -545,12 +587,23 @@ class SettingsPage(Page):
             error(self, "فعّل إشعارات تلغرام واحفظ الإعدادات أولاً.")
             return
         if not telegram.queue_report(self.db, self.db.now().date(), self.db.now().time()):
-            info(self, "لا يوجد دوام اليوم، فلم يُرسل تقرير.")
+            info(self, "لا يوجد دوام اليوم، فلم يُرسل ملخص.")
             return
         if self.ctx.telegram:
             self.ctx.telegram.wake()
         self._tg_status()
-        self.toast("أُضيف تقرير الحضور إلى الإرسال", "ok")
+        self.toast("أُضيف ملخص الدوام إلى الإرسال", "ok")
+
+    def _tg_show_preview(self):
+        from ...notify import summary as S
+
+        now = self.db.now()
+        s = S.day_summary(self.db, now.date(), now.time())
+        if s is None:
+            info(self, "لا يوجد دوام اليوم، فلا يوجد ملخص.")
+            return
+        self.preview = SummaryPreview(telegram.report_picture(s), S.caption(s), self)
+        self.preview.open()
 
     # ------------------------------------------------------------ backup
     def _backup_now(self):

@@ -260,6 +260,24 @@ def test_upgrade_applies_new_rules_from_upgrade_day(tmp_path):
     assert db.scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'تطبيق قواعد الدوام الجديدة'") == 1
 
 
+def test_upgrade_to_the_summary_report(tmp_path, monkeypatch):
+    """From 1.3 (schema 4): no message per punch any more, and reports by name are not sent."""
+    import hadir.db.store as store
+
+    monkeypatch.setattr(store, "MIGRATIONS", MIGRATIONS[:4])
+    old = Database(tmp_path / "v4.db", clock=Clock(datetime(2026, 11, 1, 9, 0)))
+    assert old.schema_version == 4
+    old.settings.set("telegram.punches", True)
+    old.x("INSERT INTO outbox (kind, text, created_at) VALUES ('report', 'تقرير بالأسماء', '2026-11-01 09:05:00')")
+    old.close()
+    monkeypatch.setattr(store, "MIGRATIONS", MIGRATIONS)
+    db = Database(tmp_path / "v4.db", clock=Clock(datetime(2026, 11, 11, 9, 0)))
+    assert db.schema_version == len(MIGRATIONS)
+    assert db.settings.get("telegram.punches") is False and db.outbox.waiting()["count"] == 0
+    db.outbox.add("report", "ملخص", photo=b"png", day="2026-11-11")
+    assert db.outbox.pending()[0]["photo"] == b"png"
+
+
 def test_upgrade_without_history_updates_in_place(tmp_path):
     make_v1_db(tmp_path / "v1.db", punches=())
     db = Database(tmp_path / "v1.db", clock=Clock(datetime(2026, 10, 28, 10, 0)))

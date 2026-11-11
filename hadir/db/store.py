@@ -1276,9 +1276,13 @@ class TemplatesRepo(_Repo):
 class OutboxRepo(_Repo):
     """Messages waiting for Telegram; kept until sent so nothing is lost while offline."""
 
-    def add(self, kind: str, text: str) -> int:
-        return self.db.x("INSERT INTO outbox (kind, text, created_at) VALUES (?,?,?)",
-                         (kind, text, self.db.now_s())).lastrowid
+    def add(self, kind: str, text: str, photo: bytes | None = None, day: str | None = None) -> int:
+        with self.db.tx():
+            if kind == "report" and day:  # a newer summary of the day replaces one still waiting
+                self.db.x("UPDATE outbox SET dropped = 1, photo = NULL WHERE kind = 'report' AND day = ?"
+                          " AND sent_at IS NULL AND dropped = 0", (day,))
+            return self.db.x("INSERT INTO outbox (kind, text, photo, day, created_at) VALUES (?,?,?,?,?)",
+                             (kind, text, photo, day, self.db.now_s())).lastrowid
 
     def pending(self, limit: int = 20):
         """Unsent messages, oldest first (they are sent in order)."""
@@ -1286,20 +1290,32 @@ class OutboxRepo(_Repo):
                          (limit,))
 
     def mark_sent(self, message_id: int) -> None:
-        self.db.x("UPDATE outbox SET sent_at = ?, last_error = '' WHERE id = ?", (self.db.now_s(), message_id))
+        self.db.x("UPDATE outbox SET sent_at = ?, last_error = '', photo = NULL WHERE id = ?",
+                  (self.db.now_s(), message_id))
 
     def mark_failed(self, message_id: int, error: str) -> None:
         self.db.x("UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?",
                   (error, message_id))
 
-    def drop_older_than(self, cutoff: datetime) -> int:
+    def drop_older_than(self, cutoff: datetime, kind: str | None = None) -> int:
         """Give up on messages that could not be sent for days (they would arrive out of date)."""
-        return self.db.x("UPDATE outbox SET dropped = 1 WHERE sent_at IS NULL AND dropped = 0 AND"
-                         " created_at < ?", (iso_dt(cutoff),)).rowcount
+        sql = ("UPDATE outbox SET dropped = 1, photo = NULL WHERE sent_at IS NULL AND dropped = 0"
+               " AND created_at < ?")
+        args = [iso_dt(cutoff)]
+        if kind:
+            sql += " AND kind = ?"
+            args.append(kind)
+        return self.db.x(sql, args).rowcount
 
-    def status(self) -> dict:
-        pending = self.db.scalar("SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL AND dropped = 0")
-        last_sent = self.db.scalar("SELECT MAX(sent_at) FROM outbox")
+    def waiting(self) -> dict:
+        """Unsent messages: how many, since when, failed attempts and the latest error."""
+        row = self.db.one("SELECT COUNT(*), MIN(created_at), COALESCE(SUM(attempts), 0) FROM outbox"
+                          " WHERE sent_at IS NULL AND dropped = 0")
         error = self.db.scalar("SELECT last_error FROM outbox WHERE sent_at IS NULL AND dropped = 0"
                                " AND last_error <> '' ORDER BY id DESC LIMIT 1")
-        return {"pending": pending, "last_sent": last_sent, "error": error or ""}
+        return {"count": row[0], "oldest": row[1], "attempts": row[2], "error": error or ""}
+
+    def status(self) -> dict:
+        w = self.waiting()
+        last_sent = self.db.scalar("SELECT MAX(sent_at) FROM outbox")
+        return {"pending": w["count"], "last_sent": last_sent, "error": w["error"]}

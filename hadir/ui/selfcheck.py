@@ -17,6 +17,7 @@ class NoCamera:
     """Camera stand-in that never delivers a frame."""
 
     state, error, fps, brightness = "error", "لا توجد كاميرا", 0.0, 0.0
+    wanted = False
 
     def latest(self):
         return None, 0
@@ -26,6 +27,15 @@ class NoCamera:
 
     def stop(self):
         pass
+
+    def restart(self, reason=""):
+        pass
+
+    def watch(self):
+        return ""
+
+    def dead_for(self):
+        return 0.0
 
 
 class IdleFaceWorker(QObject):

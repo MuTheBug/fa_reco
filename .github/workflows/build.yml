@@ -81,6 +81,11 @@ jobs:
           $p = Start-Process -FilePath "dist\Hadir\Hadir.exe" -ArgumentList "--selftest","--selftest-image","face.jpg","--selftest-out","selftest.txt" -Wait -PassThru
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selftest-summary  # the Telegram summary as the Windows build draws it
+          path: selftest-summary.png
+          if-no-files-found: ignore
       - name: File list of this version
         run: python packaging/update_files.py manifest dist/Hadir ${{ env.APP_VERSION }}
       - name: Installer (Inno Setup)
