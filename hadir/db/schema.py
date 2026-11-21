@@ -15,6 +15,38 @@ SEED_RULES_V11 = dict(grace_late=30, absent_after=60, exit_until="17:00", early_
 # Since 1.3 exit punches count from 14:30 (an early exit until 14:45).
 SEED_RULES = dict(SEED_RULES_V11, exit_window=15)
 SEED_START, SEED_END = "08:00", "14:45"
+# Since 1.5 Thursday ends at 14:30. Employees who live far away keep their own Sunday (neither late
+# nor absent until 10:00, absent after it) and leave at 14:00 on Thursday.
+SUNDAY, THURSDAY = 6, 3  # date.weekday()
+SEED_THURSDAY_END = "14:30"
+FAR_SUNDAY_LIMIT = 120  # minutes after 08:00
+FAR_THURSDAY_END = "14:00"
+
+
+def seed_days() -> list[tuple]:
+    """The department's week: (workday, start, end, grace, absent) for Monday..Sunday."""
+    days = []
+    for i in range(7):
+        if i in (4, 5):  # Friday and Saturday
+            days.append((False, None, None, None, None))
+        else:
+            days.append((True, SEED_START, SEED_THURSDAY_END if i == THURSDAY else SEED_END, None, None))
+    return days
+
+
+def seed_far_days() -> list[tuple]:
+    """The same week for those who live far away: (start, end, grace, absent) for Monday..Sunday."""
+    far = []
+    for i, (work, start, end, _, _) in enumerate(seed_days()):
+        if not work:
+            far.append((None, None, None, None))
+        elif i == SUNDAY:
+            far.append((start, end, FAR_SUNDAY_LIMIT, FAR_SUNDAY_LIMIT))
+        elif i == THURSDAY:
+            far.append((start, FAR_THURSDAY_END, None, None))
+        else:
+            far.append((start, end, None, None))
+    return far
 
 
 def upgrade_seed_schedule(conn, now: datetime) -> None:
@@ -69,6 +101,55 @@ def upgrade_seed_schedule(conn, now: datetime) -> None:
                                              SEED_END if work else None))
     conn.execute("INSERT INTO audit_log (ts, username, action, entity, entity_id, details)"
                  " VALUES (?, 'النظام', 'تطبيق قواعد الدوام الجديدة', 'schedule', ?, ?)",
+                 (stamp, new, f"اعتباراً من {today.isoformat()}"))
+
+
+def upgrade_far_rules(conn, now: datetime) -> None:
+    """Since 1.5: Thursday ends at 14:30, and those who live far away have their own Sunday and
+    Thursday. The department's schedule takes them if nobody changed it, from the upgrade day;
+    earlier days keep the rules they were recorded under."""
+    row = conn.execute("SELECT * FROM schedules WHERE name = ? AND active = 1", (SEED_SCHEDULE,)).fetchone()
+    if row is None:
+        return
+    rules = tuple(row[k] for k in ("kind", "grace_late", "absent_after", "exit_until", "early_absent",
+                                   "missing_absent", "exit_window", "continuous"))
+    if rules != ("weekly", 30, 60, "17:00", 1, 1, 15, 0):
+        return
+    days = {r["day_index"]: (r["workday"], r["start_time"], r["end_time"])
+            for r in conn.execute("SELECT * FROM schedule_days WHERE schedule_id = ?", (row["id"],))}
+    if days != {i: (1, SEED_START, SEED_END) if i not in (4, 5) else (0, None, None) for i in range(7)}:
+        return
+    old, today = row["id"], now.date()
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    history = (conn.execute("SELECT COUNT(*) FROM schedule_assignments WHERE schedule_id = ? AND"
+                            " start_date < ?", (old, today.isoformat())).fetchone()[0]
+               and conn.execute("SELECT COUNT(*) FROM punches WHERE ts < ?", (today.isoformat(),)).fetchone()[0])
+    if history:
+        until = (today - timedelta(days=1)).strftime("%Y/%m/%d")
+        conn.execute("UPDATE schedules SET name = ?, active = 0 WHERE id = ?", (f"{SEED_SCHEDULE} (حتى {until})", old))
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(schedules)") if c[1] not in ("id", "name", "created_at")]
+        new = conn.execute(f"INSERT INTO schedules (name, created_at, {', '.join(cols)}) SELECT ?, ?, {', '.join(cols)}"
+                           " FROM schedules WHERE id = ?", (SEED_SCHEDULE, stamp, old)).lastrowid
+        conn.execute("UPDATE schedules SET active = 1 WHERE id = ?", (new,))
+        for a in conn.execute("SELECT * FROM schedule_assignments WHERE schedule_id = ? AND start_date"
+                              " <= ? AND (end_date IS NULL OR end_date >= ?)",
+                              (old, today.isoformat(), today.isoformat())).fetchall():
+            conn.execute("INSERT INTO schedule_assignments (schedule_id, group_id, employee_id, start_date,"
+                         " end_date, note, created_at) VALUES (?,?,?,?,?,?,?)",
+                         (new, a["group_id"], a["employee_id"], today.isoformat(), a["end_date"],
+                          "قواعد الأحد والخميس", stamp))
+        conn.execute("UPDATE schedule_assignments SET schedule_id = ? WHERE schedule_id = ? AND start_date > ?",
+                     (new, old, today.isoformat()))
+    else:
+        new = old
+    conn.execute("DELETE FROM schedule_days WHERE schedule_id = ?", (new,))
+    for i, ((work, start, end, grace, absent), (fs, fe, fg, fa)) in enumerate(zip(seed_days(), seed_far_days())):
+        conn.execute("INSERT INTO schedule_days (schedule_id, day_index, workday, start_time, end_time, grace_late,"
+                     " absent_after, far_start, far_end, far_grace, far_absent) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (new, i, int(work), start, end, grace, absent, fs, fe, fg, fa))
+    conn.execute("UPDATE schedules SET far = 1 WHERE id = ?", (new,))
+    conn.execute("INSERT INTO audit_log (ts, username, action, entity, entity_id, details)"
+                 " VALUES (?, 'النظام', 'تطبيق قواعد الأحد والخميس', 'schedule', ?, ?)",
                  (stamp, new, f"اعتباراً من {today.isoformat()}"))
 
 
@@ -416,4 +497,18 @@ MIGRATIONS: list = [
     -- Reports by name that were still waiting are not sent any more.
     UPDATE outbox SET dropped = 1 WHERE sent_at IS NULL AND dropped = 0;
     """,
+    # 6 -- each day's own lateness and absence times; employees who live far away
+    [
+        """
+        ALTER TABLE schedule_days ADD COLUMN grace_late INTEGER;
+        ALTER TABLE schedule_days ADD COLUMN absent_after INTEGER;
+        ALTER TABLE schedule_days ADD COLUMN far_start TEXT;
+        ALTER TABLE schedule_days ADD COLUMN far_end TEXT;
+        ALTER TABLE schedule_days ADD COLUMN far_grace INTEGER;
+        ALTER TABLE schedule_days ADD COLUMN far_absent INTEGER;
+        ALTER TABLE schedules ADD COLUMN far INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE employees ADD COLUMN far INTEGER NOT NULL DEFAULT 0;
+        """,
+        upgrade_far_rules,
+    ],
 ]

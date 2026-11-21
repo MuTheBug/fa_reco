@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushB
                                QStackedWidget, QVBoxLayout, QWidget)
 
 from .. import APP_TITLE
-from ..core.security import ROLES, can
+from ..core.security import can
 from .theme import icon
 from .widgets.common import AlertBar, Toast
 
@@ -55,7 +55,6 @@ class Page(QWidget):
 
 class AdminShell(QWidget):
     kiosk_requested = Signal()
-    logout_requested = Signal()
 
     def __init__(self, ctx, parent=None):
         super().__init__(parent)
@@ -91,18 +90,10 @@ class AdminShell(QWidget):
             self.buttons[key] = b
             sl.addWidget(b)
         sl.addStretch(1)
-        self.user_lbl = QLabel()
-        self.user_lbl.setObjectName("SidebarUser")
-        self.user_lbl.setWordWrap(True)
-        sl.addWidget(self.user_lbl)
         kiosk = QPushButton("  شاشة الحضور")
         kiosk.setIcon(icon("kiosk", "#dbe5f1", 19))
         kiosk.clicked.connect(self.kiosk_requested.emit)
         sl.addWidget(kiosk)
-        out = QPushButton("  تسجيل الخروج")
-        out.setIcon(icon("logout", "#dbe5f1", 19))
-        out.clicked.connect(self.logout_requested.emit)
-        sl.addWidget(out)
         lay.addWidget(side)
 
         main = QWidget()
@@ -119,14 +110,12 @@ class AdminShell(QWidget):
         self.toaster = Toast(self)
 
     def prepare(self):
-        """Apply the signed-in user's permissions; called after each login."""
+        """Show the pages; called each time the administration is opened."""
         db = self.ctx.db
         role = db.user.role if db.user else None
         for key, _, _, _, perm in PAGES:
             self.buttons[key].setVisible(can(role, perm))
         self.org.setText(db.settings.get("org.name"))
-        if db.user:
-            self.user_lbl.setText(f"{db.user.full_name or db.user.username}\n{ROLES.get(role, role)}")
         for page in self.pages.values():
             page.deleteLater()
         self.pages.clear()

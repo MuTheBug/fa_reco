@@ -36,6 +36,7 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python tools/fetch_models.py
       - run: python -m pyflakes hadir tools tests packaging/launcher.py packaging/update_files.py packaging/install_check.py
+      - run: for f in packaging/linux/*.sh; do bash -n "$f"; done
       - run: python -m pytest -q
         env:
           QT_QPA_PLATFORM: offscreen
@@ -160,10 +161,44 @@ jobs:
           name: Hadir-files-${{ env.APP_VERSION }}
           path: dist/Hadir-files-*.txt
 
+  linux:
+    needs: test
+    # built on an older Linux so that it runs on every newer one (EndeavourOS / Arch included)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - uses: actions/cache@v4
+        with:
+          path: models/*.onnx
+          key: models-${{ hashFiles('hadir/face/models.py') }}
+      - run: pip install -r requirements.txt pyinstaller==6.22.3
+      - run: python tools/fetch_models.py
+      - name: Version
+        run: echo "APP_VERSION=$(python -c 'import hadir; print(hadir.__version__)')" >> "$GITHUB_ENV"
+      - name: Build with PyInstaller
+        run: pyinstaller packaging/hadir.spec --noconfirm
+      - name: Pack (tar.gz with install.sh)
+        run: packaging/linux/make_tarball.sh dist/Hadir "$APP_VERSION" dist
+      - name: Install, self-test, start, update and remove on Arch Linux (EndeavourOS is Arch)
+        run: |
+          curl -fsSL -o dist/face.jpg https://raw.githubusercontent.com/serengil/deepface/master/tests/unit/dataset/img1.jpg
+          docker run --rm -v "$PWD/dist:/work:ro" -v "$PWD/packaging/linux/ci_arch_check.sh:/check.sh:ro" \
+            archlinux:latest bash /check.sh "$APP_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hadir-Linux-${{ env.APP_VERSION }}
+          path: dist/Hadir-Linux-*.tar.gz
+          compression-level: 0
+
   release:
     # a pushed v* tag, or "Run workflow" with "release" ticked (the tag is then created here)
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
-    needs: windows
+    needs: [windows, linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -189,7 +224,9 @@ jobs:
           fi
           setup="out/HadirSetup-$VERSION.exe"
           update="out/HadirUpdate-$VERSION.exe"
+          linux="out/Hadir-Linux-$VERSION.tar.gz"
           test -f "$setup"
+          test -f "$linux"
           test -f "out/Hadir-Portable-$VERSION.zip"
           test -f "out/Hadir-files-$VERSION.txt"
           (cd out && sha256sum -- * > SHA256SUMS.txt)
@@ -197,6 +234,7 @@ jobs:
           mb() { echo $(( ($(stat -c %s "$1") + 524288) / 1048576 )); }
           sha() { sha256sum "$1" | cut -d' ' -f1; }
           sed -e "s|@VERSION@|$VERSION|g" -e "s|@SETUP_MB@|$(mb "$setup")|g" -e "s|@SETUP_SHA256@|$(sha "$setup")|g" \
+            -e "s|@LINUX_MB@|$(mb "$linux")|g" -e "s|@LINUX_SHA256@|$(sha "$linux")|g" \
             packaging/release-notes.md > notes.md
           if [ -f "$update" ]; then
             sed -i -e "s|@UPDATE_FROM@|$UPDATE_FROM|g" -e "s|@UPDATE_MB@|$(mb "$update")|g" \

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QComboBox, QGridLayout, QHBoxLayout, QLabel
+from PySide6.QtWidgets import (QButtonGroup, QComboBox, QDialog, QFormLayout, QGridLayout, QHBoxLayout,
+                               QLabel, QLineEdit, QPushButton, QRadioButton, QVBoxLayout)
 
 from ...core import engine as E
-from ...core.timeutil import digits, fmt_date_long
+from ...core.timeutil import digits, fmt_date_long, fmt_time
+from ...db.store import StoreError
+from ...kiosk_logic import EXIT_REASONS, exit_state, record_exit
 from ...reports import sources as S
 from ..admin import Page
 from ..theme import C
-from ..widgets.common import Card, DataTable, PageHeader, SearchBox, StatTile, button, label
+from ..widgets.common import Card, DataTable, PageHeader, SearchBox, StatTile, TimeEdit, button, error, label
 
 
 class DashboardPage(Page):
@@ -55,6 +60,10 @@ class DashboardPage(Page):
         tools.addWidget(label("المجموعة:"))
         tools.addWidget(self.group)
         tools.addStretch(1)
+        self.exit_btn = button("تسجيل خروج", "logout", "primary")
+        self.exit_btn.setToolTip("لموظف يغادر أثناء الدوام: إجازة ساعية أو يومية أو دون إجازة")
+        self.exit_btn.clicked.connect(self._record_exit)
+        tools.addWidget(self.exit_btn)
         tools.addWidget(self.search)
         card.lay.addLayout(tools)
         self.table = DataTable([
@@ -115,3 +124,92 @@ class DashboardPage(Page):
 
     def _open_timeline(self, row):
         self.ctx.window.admin.show_page("timeline", employee_id=row["employee_id"])
+
+    def _record_exit(self):
+        row = self.table.selected()
+        if row is None:
+            error(self, "اختر من الجدول الموظف الذي يغادر.")
+            return
+        rec, why = exit_state(self.db, row["employee_id"], self.db.now())
+        if why:
+            error(self, f"{row['name']}: {why}")
+            return
+        dlg = ExitDialog(self.db, row["employee_id"], row["name"], rec, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.refresh()
+            self.toast(f"سُجّل خروج {row['name']}", "ok")
+
+
+class ExitDialog(QDialog):
+    """An employee leaving during the working day, and why."""
+
+    def __init__(self, db, employee_id: int, name: str, rec: E.DayRecord, parent=None):
+        super().__init__(parent)
+        self.db, self.employee_id, self.rec = db, employee_id, rec
+        self.setWindowTitle(f"تسجيل خروج — {name}")
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        lay.addWidget(label(f"{name}: الحضور {fmt_time(rec.check_in)} • نهاية الدوام {fmt_time(rec.shift.end)}",
+                            "CardTitle", wrap=True))
+        form = QFormLayout()
+        now = db.now()
+        self.time = TimeEdit(now.time())
+        form.addRow("وقت الخروج:", self.time)
+        types = [t for t in db.leaves.types(include_inactive=False)]
+        self.hourly_types = [t for t in types if t["unit"] == "hour"]
+        self.daily_type = QComboBox()
+        for t in types:
+            if t["unit"] != "hour":
+                self.daily_type.addItem(t["name"], t["id"])
+        self.choice = QButtonGroup(self)
+        self.options = {}
+        box = QVBoxLayout()
+        for key, text in EXIT_REASONS.items():
+            rb = QRadioButton(text)
+            self.choice.addButton(rb)
+            self.options[key] = rb
+            if key == "daily":
+                row = QHBoxLayout()
+                row.addWidget(rb)
+                row.addWidget(self.daily_type, 1)
+                box.addLayout(row)
+            else:
+                box.addWidget(rb)
+        self.options["plain"].setText("دون إجازة (يُحسب حسب قواعد الدوام)")
+        if not self.hourly_types:
+            self.options["hourly"].setEnabled(False)
+        (self.options["hourly"] if self.hourly_types else self.options["plain"]).setChecked(True)
+        form.addRow("السبب:", box)
+        self.note = QLineEdit()
+        self.note.setPlaceholderText("اختياري: مثل رقم الإجازة أو سبب المغادرة")
+        form.addRow("ملاحظة:", self.note)
+        lay.addLayout(form)
+        lay.addWidget(label("لا يُسجَّل للموظف خروج ثانٍ في اليوم نفسه.", "Hint", wrap=True))
+        buttons = QHBoxLayout()
+        ok = QPushButton("تسجيل الخروج")
+        ok.setProperty("kind", "primary")
+        ok.clicked.connect(self.save)
+        cancel = QPushButton("إلغاء")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        buttons.addStretch(1)
+        lay.addLayout(buttons)
+
+    def reason(self) -> str:
+        return next(k for k, rb in self.options.items() if rb.isChecked())
+
+    def save(self):
+        ts = datetime.combine(self.db.now().date(), self.time.value())
+        reason = self.reason()
+        type_id = (self.hourly_types[0]["id"] if reason == "hourly" else
+                   self.daily_type.currentData() if reason == "daily" else None)
+        if ts > self.db.now():
+            error(self, "وقت الخروج لم يأتِ بعد.")
+            return
+        try:
+            record_exit(self.db, self.employee_id, ts, reason, type_id, self.note.text())
+        except StoreError as exc:
+            error(self, str(exc))
+            return
+        self.accept()

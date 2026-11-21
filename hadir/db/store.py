@@ -203,7 +203,7 @@ class Database:
         out = {r["id"]: E.EmployeeData(
             r["id"], r["full_name"], r["code"], parse_date(r["hire_date"]), parse_date(r["end_date"]),
             cycle_start=parse_date(r["cycle_start"]), own_start=parse_time(r["own_start"]),
-            own_end=parse_time(r["own_end"]))
+            own_end=parse_time(r["own_end"]), far=bool(r["far"]))
             for r in rows}
         if not ids:
             return []
@@ -337,9 +337,26 @@ class UsersRepo(_Repo):
         self.db.audit("تسجيل دخول", "user", row["id"])
         return user
 
+    def enter(self) -> User:
+        """Open the administration: there are no passwords, so it opens as the first active
+        administrator (one is created if there is none)."""
+        row = self.db.one("SELECT * FROM users WHERE role = 'admin' AND active = 1 ORDER BY id LIMIT 1")
+        if row is None:
+            with self.db.tx():
+                old = self.db.one("SELECT id FROM users WHERE username = 'admin'")
+                if old is not None:
+                    self.db.x("UPDATE users SET role = 'admin', active = 1 WHERE id = ?", (old["id"],))
+                else:
+                    self.db.x("INSERT INTO users (username, full_name, password_hash, role, created_at)"
+                              " VALUES ('admin', 'مدير النظام', '', 'admin', ?)", (self.db.now_s(),))
+            row = self.db.one("SELECT * FROM users WHERE role = 'admin' AND active = 1 ORDER BY id LIMIT 1")
+        user = User(row["id"], row["username"], row["full_name"], row["role"])
+        self.db.x("UPDATE users SET last_login = ? WHERE id = ?", (self.db.now_s(), row["id"]))
+        self.db.user = user
+        self.db.audit("فتح الإدارة", "user", row["id"])
+        return user
+
     def logout(self) -> None:
-        if self.db.user:
-            self.db.audit("تسجيل خروج", "user", self.db.user.id)
         self.db.user = None
 
     def set_password(self, user_id: int, password: str) -> None:
@@ -434,15 +451,22 @@ class SchedulesRepo(_Repo):
                          (schedule_id,))
 
     def _engine(self, row, days) -> E.Schedule:
-        rules = tuple(E.DayRule(bool(d["workday"]), parse_time(d["start_time"]), parse_time(d["end_time"]))
-                      for d in days)
+        rules = tuple(E.DayRule(bool(d["workday"]), parse_time(d["start_time"]), parse_time(d["end_time"]),
+                                d["grace_late"], d["absent_after"]) for d in days)
+        far = ()
+        if row["far"]:  # the days of those who live far away; an empty value is as everyone's
+            far = tuple(E.DayRule(bool(d["workday"]), parse_time(d["far_start"] or d["start_time"]),
+                                  parse_time(d["far_end"] or d["end_time"]),
+                                  d["grace_late"] if d["far_grace"] is None else d["far_grace"],
+                                  d["absent_after"] if d["far_absent"] is None else d["far_absent"])
+                        for d in days)
         return E.Schedule(row["id"], row["name"], row["kind"], rules, parse_date(row["cycle_anchor"]),
                           row["grace_late"], row["grace_early"], bool(row["late_after_grace"]),
                           row["window_before"], row["window_after"], row["overtime_min"],
                           absent_after=row["absent_after"], exit_until=parse_time(row["exit_until"]),
                           early_absent=bool(row["early_absent"]),
                           missing_absent=bool(row["missing_absent"]), continuous=bool(row["continuous"]),
-                          exit_window=row["exit_window"])
+                          exit_window=row["exit_window"], far_days=far)
 
     def get(self, schedule_id: int) -> E.Schedule | None:
         row = self.db.one("SELECT * FROM schedules WHERE id = ?", (schedule_id,))
@@ -459,11 +483,18 @@ class SchedulesRepo(_Repo):
         """data: name, kind, cycle_anchor, grace_late, grace_early, late_after_grace,
         window_before, window_after, overtime_min, absent_after, exit_until 'HH:MM' or None,
         early_absent, missing_absent, continuous, exit_window, notes, active,
-        days: [(workday, start 'HH:MM', end 'HH:MM'), ...]"""
+        days: [(workday, start 'HH:MM', end 'HH:MM'[, grace, absent]), ...] where grace/absent are the
+        day's own minutes after the start (None: the schedule's),
+        far: whether those who live far away have their own days,
+        far_days: [(start, end, grace, absent), ...] for them (None values: as everyone's)"""
         name = (data.get("name") or "").strip()
         if not name:
             raise StoreError("اسم الجدول مطلوب.")
-        days = data.get("days") or []
+        days = [tuple(d) + (None,) * (5 - len(d)) for d in data.get("days") or []]
+        far = bool(data.get("far")) and data.get("kind", "weekly") == "weekly"
+        far_days = [tuple(d) for d in data.get("far_days") or []] if far else []
+        if far and len(far_days) != len(days):
+            raise StoreError("أوقات الساكنين بعيداً تحتاج يوماً لكل يوم من أيام الجدول.")
         kind = data.get("kind", "weekly")
         if kind == "weekly" and len(days) != 7:
             raise StoreError("الجدول الأسبوعي يحتاج سبعة أيام.")
@@ -471,36 +502,44 @@ class SchedulesRepo(_Repo):
             raise StoreError("طول الدورة يجب أن يكون بين ١ و٦٢ يوماً.")
         if kind == "cycle" and not data.get("cycle_anchor"):
             raise StoreError("حدّد تاريخ بداية الدورة.")
-        for wd, st, en in days:
+        for wd, st, en, _, _ in days:
             if wd and (not st or not en):
                 raise StoreError("حدّد وقت البداية والنهاية لكل يوم دوام.")
-        if not any(wd for wd, _, _ in days):
+        if not any(d[0] for d in days):
             raise StoreError("يجب أن يحتوي الجدول على يوم دوام واحد على الأقل.")
         dup = self.db.one("SELECT id FROM schedules WHERE name = ? AND id <> ?", (name, schedule_id or 0))
         if dup:
             raise StoreError("يوجد جدول بهذا الاسم.")
         fields = ("name", "kind", "cycle_anchor", "grace_late", "grace_early", "late_after_grace",
                   "window_before", "window_after", "overtime_min", "absent_after", "exit_until",
-                  "early_absent", "missing_absent", "continuous", "exit_window", "notes", "active")
+                  "early_absent", "missing_absent", "continuous", "exit_window", "notes", "active", "far")
         defaults = {"cycle_anchor": None, "grace_late": 10, "grace_early": 0, "late_after_grace": 0,
                     "window_before": 240, "window_after": 480, "overtime_min": 30, "absent_after": 0,
                     "exit_until": None, "early_absent": 0, "missing_absent": 0, "continuous": 0,
-                    "exit_window": 0, "notes": "", "active": 1}
+                    "exit_window": 0, "notes": "", "active": 1, "far": 0}
         values = {f: data.get(f, defaults.get(f)) for f in fields}
-        values["name"], values["kind"] = name, kind
+        values["name"], values["kind"], values["far"] = name, kind, int(far)
         values["cycle_anchor"] = _d(values["cycle_anchor"]) if kind == "cycle" else None
         for f in ("late_after_grace", "early_absent", "missing_absent", "continuous", "active"):
             values[f] = int(bool(values[f]))
-        if values["continuous"] and all(wd for wd, _, _ in days):
+        if values["continuous"] and all(d[0] for d in days):
             raise StoreError("النوبة المتصلة تحتاج يوم استراحة واحداً على الأقل في الجدول.")
         values["absent_after"] = int(values["absent_after"] or 0)
         values["exit_window"] = max(0, int(values["exit_window"] or 0))
         values["exit_until"] = _t(values["exit_until"])
         if values["absent_after"] and values["absent_after"] <= int(values["grace_late"]):
             raise StoreError("وقت احتساب الغياب يجب أن يكون بعد انتهاء سماحية التأخير.")
+        times = [(wd, st, en, g, a) for wd, st, en, g, a in days]
+        times += [(wd, fs or st, fe or en, g if fg is None else fg, a if fa is None else fa)
+                  for (wd, st, en, g, a), (fs, fe, fg, fa) in zip(days, far_days)]
+        for wd, st, en, g, a in times:
+            grace = int(values["grace_late"]) if g is None else int(g)
+            absent = values["absent_after"] if a is None else int(a)
+            if wd and absent and absent < grace:
+                raise StoreError("وقت الغياب في أحد الأيام يسبق نهاية وقت «لا تأخير»؛ اجعله بعده أو مساوياً له.")
         if values["exit_until"]:
             last = parse_time(values["exit_until"])
-            for wd, st, en in days:
+            for wd, st, en, _, _ in times:
                 st, en = parse_time(_t(st)), parse_time(_t(en))
                 if wd and st < en and last < en:
                     raise StoreError(f"آخر وقت لبصمة الخروج ({values['exit_until']}) يسبق وقت الخروج"
@@ -518,10 +557,15 @@ class SchedulesRepo(_Repo):
                           [values[f] for f in fields] + [schedule_id])
                 self.db.x("DELETE FROM schedule_days WHERE schedule_id = ?", (schedule_id,))
                 self.db.audit("تعديل جدول دوام", "schedule", schedule_id, name)
-            for i, (wd, st, en) in enumerate(days):
-                self.db.x("INSERT INTO schedule_days (schedule_id, day_index, workday, start_time,"
-                          " end_time) VALUES (?,?,?,?,?)",
-                          (schedule_id, i, int(bool(wd)), _t(st) if wd else None, _t(en) if wd else None))
+            for i, (wd, st, en, g, a) in enumerate(days):
+                fs, fe, fg, fa = far_days[i] if far else (None, None, None, None)
+                on = bool(wd)
+                self.db.x("INSERT INTO schedule_days (schedule_id, day_index, workday, start_time, end_time,"
+                          " grace_late, absent_after, far_start, far_end, far_grace, far_absent)"
+                          " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                          (schedule_id, i, int(on), _t(st) if on else None, _t(en) if on else None,
+                           g if on else None, a if on else None, _t(fs) if on else None,
+                           _t(fe) if on else None, fg if on else None, fa if on else None))
         return schedule_id
 
     def longest_continuous(self) -> int:
@@ -606,7 +650,7 @@ class EmployeesRepo(_Repo):
         return str(max(nums) + 1 if nums else 1001)
 
     FIELDS = ("code", "full_name", "job_title", "department", "phone", "notes", "hire_date",
-              "end_date", "active", "cycle_start", "own_start", "own_end")
+              "end_date", "active", "cycle_start", "own_start", "own_end", "far")
 
     def save(self, data: dict, employee_id: int | None = None, group_effective=None) -> int:
         """Add an employee or change the fields present in ``data`` (others are kept).
@@ -622,7 +666,7 @@ class EmployeesRepo(_Repo):
         if old is None:
             values = dict(code="", full_name="", job_title="", department="", phone="", notes="",
                           hire_date=None, end_date=None, active=1, cycle_start=None, own_start=None,
-                          own_end=None)
+                          own_end=None, far=0)
         else:
             values = {f: old[f] for f in self.FIELDS}
         values.update({f: data[f] for f in self.FIELDS if f in data})
@@ -630,6 +674,7 @@ class EmployeesRepo(_Repo):
             values[f] = str(values[f] or "").strip()
         values["notes"] = values["notes"] or ""
         values["active"] = int(bool(values["active"]))
+        values["far"] = int(bool(values["far"]))
         values["hire_date"], values["end_date"] = _d(values["hire_date"]), _d(values["end_date"])
         values["cycle_start"] = _d(values["cycle_start"])
         values["own_start"], values["own_end"] = _t(values["own_start"]), _t(values["own_end"])
@@ -1175,7 +1220,7 @@ class PunchesRepo(_Repo):
 # ---------------------------------------------------------------------------
 EVENT_LABELS = {
     "login_failed": "دخول فاشل",
-    "spoof": "اشتباه انتحال (صورة/شاشة)",
+    "spoof": "محاولة تزوير حضور (وجه على هاتف أو صورة)",
     "unknown_face": "وجه غير معروف",
     "ambiguous": "تشابه بين موظفين",
     "clock_back": "إرجاع ساعة الجهاز",
@@ -1285,9 +1330,9 @@ class OutboxRepo(_Repo):
                              (kind, text, photo, day, self.db.now_s())).lastrowid
 
     def pending(self, limit: int = 20):
-        """Unsent messages, oldest first (they are sent in order)."""
-        return self.db.q("SELECT * FROM outbox WHERE sent_at IS NULL AND dropped = 0 ORDER BY id LIMIT ?",
-                         (limit,))
+        """Unsent messages: urgent alerts first, then the others oldest first (sent in order)."""
+        return self.db.q("SELECT * FROM outbox WHERE sent_at IS NULL AND dropped = 0"
+                         " ORDER BY kind = 'alert' DESC, id LIMIT ?", (limit,))
 
     def mark_sent(self, message_id: int) -> None:
         self.db.x("UPDATE outbox SET sent_at = ?, last_error = '', photo = NULL WHERE id = ?",
@@ -1309,11 +1354,11 @@ class OutboxRepo(_Repo):
 
     def waiting(self) -> dict:
         """Unsent messages: how many, since when, failed attempts and the latest error."""
-        row = self.db.one("SELECT COUNT(*), MIN(created_at), COALESCE(SUM(attempts), 0) FROM outbox"
-                          " WHERE sent_at IS NULL AND dropped = 0")
+        row = self.db.one("SELECT COUNT(*), MIN(created_at), COALESCE(SUM(attempts), 0),"
+                          " COALESCE(SUM(kind = 'alert'), 0) FROM outbox WHERE sent_at IS NULL AND dropped = 0")
         error = self.db.scalar("SELECT last_error FROM outbox WHERE sent_at IS NULL AND dropped = 0"
                                " AND last_error <> '' ORDER BY id DESC LIMIT 1")
-        return {"count": row[0], "oldest": row[1], "attempts": row[2], "error": error or ""}
+        return {"count": row[0], "oldest": row[1], "attempts": row[2], "alerts": row[3], "error": error or ""}
 
     def status(self) -> dict:
         w = self.waiting()

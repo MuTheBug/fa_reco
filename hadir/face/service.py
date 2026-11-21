@@ -103,17 +103,24 @@ def maybe_adapt(db: Database, engine: FaceEngine, decision: Decision, threshold:
     return True
 
 
-def save_snapshot(root: Path, frame: np.ndarray, box, ts: datetime, tag: str) -> str:
-    """Store a small evidence picture of the punch; returns the path relative to ``root``."""
+def save_snapshot(root: Path, frame: np.ndarray, box, ts: datetime, tag: str, wide: bool = False) -> str:
+    """Store a small evidence picture of the punch; returns the path relative to ``root``.
+    ``wide`` keeps the whole picture with the face marked (shows a phone held to the camera)."""
     h, w = frame.shape[:2]
     x, y, bw, bh = [float(v) for v in box]
-    cx, cy, s = x + bw / 2, y + bh / 2, max(bw, bh) * 1.7
-    x0, y0 = int(max(0, cx - s / 2)), int(max(0, cy - s / 2))
-    x1, y1 = int(min(w, cx + s / 2)), int(min(h, cy + s / 2))
-    crop = frame[y0:y1, x0:x1]
+    if wide:
+        crop = frame.copy()
+        cv2.rectangle(crop, (int(x), int(y)), (int(x + bw), int(y + bh)), (38, 38, 220), max(2, w // 320))
+        size = 480.0
+    else:
+        cx, cy, s = x + bw / 2, y + bh / 2, max(bw, bh) * 1.7
+        x0, y0 = int(max(0, cx - s / 2)), int(max(0, cy - s / 2))
+        x1, y1 = int(min(w, cx + s / 2)), int(min(h, cy + s / 2))
+        crop = frame[y0:y1, x0:x1]
+        size = 240.0
     if crop.size == 0:
         crop = frame
-    scale = 240.0 / max(crop.shape[:2])
+    scale = size / max(crop.shape[:2])
     if scale < 1:
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     rel = Path(ts.strftime("%Y/%m/%d")) / f"{ts.strftime('%H%M%S')}_{tag}.jpg"

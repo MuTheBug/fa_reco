@@ -8,8 +8,11 @@ A punch is accepted only when *all* of the following hold:
    (protects look-alikes such as brothers).
 3. The independent SFace model does not prefer somebody else and agrees that
    the face resembles the claimed employee (dual-engine verification).
-4. The passive anti-spoofing models say the face is live, otherwise the person
-   must pass a random head-turn challenge while staying the same identity.
+4. The passive anti-spoofing models say the face is live. When they are unsure the
+   person must pass a random head-turn challenge while staying the same identity, and
+   look live while turning. A video on a phone can turn its head too, so the head turn
+   never makes up for a face the models find fake: a clearly fake face (a photo, or a
+   screen) is refused at once, and so is one that stays fake during the head turn.
 """
 
 from __future__ import annotations
@@ -29,7 +32,8 @@ from .models import ARCFACE_R100, SFACE, is_available
 from .quality import Quality, assess
 
 LIVE_PASS = 0.70  # passive score that needs no challenge
-LIVE_SPOOF = 0.25  # passive score treated as a likely attack
+LIVE_SPOOF = 0.25  # below this the face must also look live while it turns its head
+LIVE_FAKE = 0.10  # clearly a photo or a screen: refused at once, no head turn is asked for
 SECONDARY_FLOOR = 0.25  # SFace must at least find a weak resemblance
 SCAN_TIMEOUT = 5.0
 LOST_FACE = 0.8
@@ -178,6 +182,7 @@ class RecognitionSession:
         self.last_seen = 0.0
         self.last_center = None
         self.challenge: HeadTurnChallenge | None = None
+        self.challenge_live: list[float] = []
         self.claim: Decision | None = None
         self.cooldown_until = 0.0
         self.cooldown_kind = ""
@@ -199,7 +204,7 @@ class RecognitionSession:
         now = self.clock()
         scanning = self.state in ("idle", "scanning", "challenge")
         a = self.engine.analyze(frame, min_eye_px=self.min_eye_px, embed=scanning,
-                                live=self.state in ("idle", "scanning"), flip=self.probe_flip)
+                                live=scanning and self.liveness_mode != "off", flip=self.probe_flip)
         st = Status(state=self.state, quality=a.quality, liveness=a.liveness, ms=a.ms)
         if a.face is not None:
             st.box, st.landmarks = a.face.box, a.face.landmarks
@@ -253,6 +258,7 @@ class RecognitionSession:
         self.evidence = []
         self.started = now
         self.challenge = None
+        self.challenge_live = []
         self.claim = None
 
     # --------------------------------------------------------------- scanning
@@ -287,11 +293,18 @@ class RecognitionSession:
             live_score = float(np.mean(live)) if live else None
             claim = Decision("accept", best_id, best, best - second, sec_score, live_score,
                              runner_up=second_id, best=self._best(recent))
+            if self.liveness_mode != "off" and live_score is not None and live_score < LIVE_FAKE:
+                if len(live) < 3 and not timed_out:
+                    return st, None  # one more look before calling it fake
+                # A photo, or a video on a phone: no head turn makes up for it (the video turns too).
+                claim.kind = "spoof"
+                return self._finish(st, now, claim)
             needs_challenge = self.liveness_mode == "always" or (
                 self.liveness_mode == "auto" and live_score is not None and live_score < LIVE_PASS)
             if needs_challenge:
                 self.state = "challenge"
                 self.claim = claim
+                self.challenge_live = live  # the face must look live over the whole check
                 self.challenge = HeadTurnChallenge.random(self.mirror, now)
                 self.challenge.update(a.quality.yaw, now)
                 return self._challenge_status(st, a, now)
@@ -337,6 +350,12 @@ class RecognitionSession:
         limit = self.thresholds[0] - (0.15 if abs(a.quality.yaw) < 0.25 else 0.25)
         if score < limit:
             return self._finish(st, now, Decision("unknown", None, score, best=claim.best))
+        if a.liveness is not None:
+            self.challenge_live.append(a.liveness)
+            turning = self.challenge_live[-4:]
+            if len(turning) >= 3 and float(np.mean(turning)) < LIVE_FAKE:
+                # Turning its head, but clearly a screen: a video on a phone.
+                return self._finish(st, now, self._fake(float(np.mean(turning))))
         self.challenge.update(a.quality.yaw, now)
         return self._challenge_status(st, a, now)
 
@@ -344,6 +363,10 @@ class RecognitionSession:
         ch = self.challenge
         st.state, st.challenge = "challenge", ch.direction
         if ch.result == "passed":
+            overall = float(np.mean(self.challenge_live)) if self.challenge_live else None
+            if overall is not None and overall < LIVE_SPOOF:
+                # The head turned as asked, but the face did not look live: a video.
+                return self._finish(st, now, self._fake(overall))
             self.claim.challenge = "passed"
             return self._finish(st, now, self.claim)
         if ch.result == "failed":
@@ -355,6 +378,12 @@ class RecognitionSession:
         st.tone, st.message = "warn", ch.prompt
         st.progress = min(1.0, (now - ch.started) / ch.timeout)
         return st, None
+
+    def _fake(self, liveness: float) -> Decision:
+        """Refused during the head-turn test: the face did not look live while turning."""
+        c = self.claim
+        return Decision("spoof", c.employee_id, c.score, c.margin, c.secondary, liveness,
+                        challenge="fake", runner_up=c.runner_up, best=c.best)
 
     def _finish(self, st: Status, now: float, decision: Decision):
         self.state = "cooldown"

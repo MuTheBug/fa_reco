@@ -305,6 +305,113 @@ def test_offline_error_and_chat_discovery(monkeypatch):
     assert T.find_chats("123:ABC") == [("-100123", "الحضور"), ("-100999", "القناة")]
 
 
+# ---------------------------------------------------------------- urgent alerts
+class Ticks:
+    def __init__(self):
+        self.t = 5000.0
+
+    def __call__(self):
+        return self.t
+
+
+def camera_frame(shade=120):
+    import numpy as np
+
+    frame = np.full((360, 640, 3), shade, np.uint8)
+    frame[100:260, 250:390] = (60, 90, 200)  # the face shown on the phone
+    return frame
+
+
+def spoof(eid, frame):
+    from types import SimpleNamespace
+
+    from hadir.face.pipeline import Decision
+
+    best = SimpleNamespace(frame=frame, face=SimpleNamespace(box=(250.0, 100.0, 140.0, 160.0)))
+    return Decision("spoof", eid, 0.82, liveness=0.01, best=best)
+
+
+def test_a_face_on_a_phone_sends_an_urgent_alert_with_pictures(db, qapp):
+    switch_on(db)
+    eid = add(db, "سارة <الغائبة>", job="مهندسة")
+    ticks = Ticks()
+    logic = KioskLogic(db, clock=ticks)
+    ts = datetime(2026, 10, 25, 8, 12)
+    res = logic.handle(spoof(eid, camera_frame()), camera_frame(), ts, 0.45)
+    assert res.kind == "spoof" and res.tone == "bad" and res.alert is not None
+    assert res.lines[-1] == "سُجّلت هذه المحاولة وأُبلغت الإدارة"
+    assert db.scalar("SELECT COUNT(*) FROM punches") == 0  # nothing is recorded for her
+    event = db.one("SELECT * FROM security_events WHERE kind = 'spoof'")
+    assert event["employee_id"] == eid and "أُرسل تنبيه طارئ" in event["details"]
+    assert logic.send_alert(res.alert, camera_frame(90)) == 1
+    [m] = db.outbox.pending()
+    assert m["kind"] == "alert" and m["photo"][:2] == b"\xff\xd8"  # a JPEG of what the camera saw
+    text = m["text"]
+    assert text.startswith("🚨 <b>تنبيه طارئ: محاولة تزوير حضور</b>")
+    assert "سارة &lt;الغائبة&gt; — مهندسة" in text and "الأحد 2026/10/25 الساعة 08:12" in text
+    assert "دائرة الاختبار" in text and "بعدها بثانيتين" in text
+
+    # alerts are at least a minute apart; another face shown after that gets its own alert
+    other = add(db, "زميل آخر")
+    ticks.t = 5030
+    assert logic.handle(spoof(other, camera_frame()), None, ts, 0.45).alert is None
+    ticks.t = 5061
+    assert logic.handle(spoof(other, camera_frame()), None, ts, 0.45).alert is not None
+    # the same phone tried again and again: one alert in ten minutes (every attempt is logged)
+    ticks.t = 5200
+    again = logic.handle(spoof(eid, camera_frame()), camera_frame(), ts, 0.45)
+    assert again.kind == "spoof" and again.alert is None and "أُبلغت" not in " ".join(again.lines)
+    assert db.scalar("SELECT COUNT(*) FROM security_events WHERE kind = 'spoof'") == 4
+    ticks.t = 5601
+    assert logic.handle(spoof(eid, camera_frame()), None, ts, 0.45).alert is not None
+
+
+def test_alerts_have_a_daily_limit_and_can_be_switched_off(db):
+    switch_on(db)
+    eid = add(db, "علي")
+    ticks = Ticks()
+    logic = KioskLogic(db, clock=ticks)
+    ts = datetime(2026, 10, 25, 9, 0)
+    for _ in range(10):
+        db.outbox.add("alert", "تنبيه")
+    assert logic.handle(spoof(eid, None), None, ts, 0.45).alert is None
+    db.settings.set("telegram.fraud_alerts", False)
+    db.clock.now = datetime(2026, 10, 26, 9, 0)
+    logic = KioskLogic(db, clock=ticks)
+    res = logic.handle(spoof(eid, None), None, datetime(2026, 10, 26, 9, 0), 0.45)
+    assert res.kind == "spoof" and res.alert is None
+    db.settings.set("telegram.fraud_alerts", True)
+    res = logic.handle(spoof(eid, None), None, datetime(2026, 10, 26, 9, 0), 0.45)
+    assert res.alert is not None and logic.send_alert(res.alert) == 1  # no picture: the text alone
+    m = db.outbox.pending()[0]
+    assert m["kind"] == "alert" and m["photo"] is None and "في الصورة" not in m["text"]
+
+
+def test_alerts_go_first_and_wait_for_the_internet(db):
+    switch_on(db)
+    db.outbox.add("punch", "بصمة")
+    db.outbox.add("report", "ملخص", day="2026-10-25")
+    db.outbox.add("alert", "تنبيه", photo=b"\xff\xd8jpeg")
+    fake = FakeTransport(fail=[T.TelegramError(T.NETWORK_ERROR)])
+    sender = T.Sender(db, transport=fake, gap=0)
+    assert sender.step() == 0
+    text = T.waiting_alert(db, datetime(2026, 10, 25, 8, 30))
+    assert "تقارير الدوام وتنبيهاته بانتظار الإرسال" in text and "(3)" in text
+    db.clock.now = datetime(2026, 11, 10, 9, 0)  # two weeks offline: the alert is still sent, first
+    assert T.Sender(db, transport=fake, gap=0).step() == 2
+    assert [t for _, _, t in fake.sent] == ["تنبيه", "ملخص"]
+    assert fake.extras[0] == (b"\xff\xd8jpeg", True)
+
+
+def test_camera_pictures_are_sent_as_jpeg(monkeypatch):
+    calls = []
+    monkeypatch.setattr(T, "call", lambda token, method, payload=None, timeout=20, files=None:
+                        calls.append((method, files["photo"][0], files["photo"][2])))
+    T.deliver("1:A", "-1", "تنبيه", b"\xff\xd8\xff\xe0jpeg", html=True)
+    T.deliver("1:A", "-1", "ملخص", b"\x89PNG\r\n", html=True)
+    assert calls == [("sendPhoto", "camera.jpg", "image/jpeg"), ("sendPhoto", "summary.png", "image/png")]
+
+
 # ---------------------------------------------------------------- kiosk and strict rules
 def test_kiosk_explains_absence_and_refuses_after_last_exit_time(db):
     eid = add(db, "علي")
@@ -350,13 +457,11 @@ def test_kiosk_records_nothing_after_the_day_s_exit(db):
     assert db.scalar("SELECT COUNT(*) FROM punches WHERE employee_id = ?", (eid,)) == 2
     assert db.scalar("SELECT COUNT(*) FROM outbox") == 2
     assert db.scalar("SELECT COUNT(*) FROM security_events") == 0
-    # an early exit can still be followed by the real one
+    # one exit a day: after an early exit nothing more is recorded either
     other = add(db, "ليلى")
-    for hhmm in ("08:00", "14:35", "14:50"):
+    for hhmm, kind in (("08:00", "punched"), ("14:35", "punched"), ("14:50", "left")):
         db.clock.now = datetime.fromisoformat(f"2026-10-25 {hhmm}")
-        assert logic.register(other, db.clock.now).kind == "punched"
-    db.clock.now = datetime(2026, 10, 25, 15, 0)
-    assert logic.register(other, db.clock.now).kind == "left"
+        assert logic.register(other, db.clock.now).kind == kind
 
 
 def test_hourly_leave_until_the_end_of_the_day_is_not_an_absence(db):

@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QDialog, QMainWindow, QStackedWidget
+from PySide6.QtWidgets import QMainWindow, QStackedWidget
 
 from .. import APP_SUBTITLE, APP_TITLE
 from ..core import maintenance
@@ -17,10 +17,10 @@ from ..kiosk_logic import KioskLogic
 from ..notify import telegram
 from ..paths import backups_dir, snapshots_dir
 from .admin import AdminShell
-from .dialogs import LoginDialog
+from .awake import KeepAwake
 from .face_worker import FaceWorker
 from .kiosk import KioskScreen
-from .widgets.common import Toast, error
+from .widgets.common import Toast, confirm
 
 
 class AppContext:
@@ -80,7 +80,6 @@ class MainWindow(QMainWindow):
         self.toaster = Toast(self)
         self.kiosk.admin_requested.connect(self.request_admin)
         self.admin.kiosk_requested.connect(self.show_kiosk)
-        self.admin.logout_requested.connect(self.show_kiosk)
         QShortcut(QKeySequence("Ctrl+Shift+A"), self, activated=self.request_admin)
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
 
@@ -114,6 +113,7 @@ class MainWindow(QMainWindow):
         self._alert_toast_at = -ALERT_TOAST_SECONDS
         self._allow_close = False
         self.in_kiosk = kiosk_first
+        self.awake = KeepAwake()  # no screen lock while the attendance screen is shown (Linux)
 
     # ------------------------------------------------------------- startup
     def start(self):
@@ -144,16 +144,16 @@ class MainWindow(QMainWindow):
         self.kiosk.refresh_settings()
         self.stack.setCurrentWidget(self.kiosk)
         self.kiosk.activate()
+        self.awake.on()
         if initial or not self.isFullScreen():
             self.showFullScreen()
 
     def request_admin(self):
         if not self.in_kiosk:
             return
-        dlg = LoginDialog(self.ctx.db, self)
-        if dlg.exec() != QDialog.Accepted:
-            return
+        self.ctx.db.users.enter()  # no passwords
         self.in_kiosk = False
+        self.awake.off()
         self.kiosk.deactivate()
         self.ctx.worker.set_mode("idle")
         self.stack.setCurrentWidget(self.admin)
@@ -260,23 +260,15 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):
-        if self._allow_close or not self.in_kiosk:
-            self._shutdown()
-            ev.accept()
-            return
-        dlg = LoginDialog(self.ctx.db, self)
-        dlg.setWindowTitle("إغلاق البرنامج — يتطلب كلمة مرور الإدارة")
-        if dlg.exec() == QDialog.Accepted and dlg.user and dlg.user.role == "admin":
-            self.ctx.db.users.logout()
+        if self._allow_close or not self.in_kiosk or confirm(
+                self, "إغلاق شاشة الحضور؟ لا تُسجَّل البصمات حتى يُفتح البرنامج من جديد.", "إغلاق البرنامج"):
             self._shutdown()
             ev.accept()
         else:
-            if dlg.user:
-                self.ctx.db.users.logout()
-                error(self, "إغلاق البرنامج متاح لمدير النظام فقط.")
             ev.ignore()
 
     def _shutdown(self):
+        self.awake.off()
         self.ctx.worker.stop()
         self.ctx.camera.stop()
 

@@ -521,15 +521,15 @@ def test_a_punch_after_leaving_is_not_a_second_exit(window_org):
     r = one_day(day("08:00", "14:50", "15:50"), window_org, SUN)
     assert (r.status, r.check_out, r.overtime, r.worked) == (E.PRESENT, datetime(2026, 10, 25, 14, 50), 0, 410)
     assert "extra_punch" in r.flags
-    # an early exit can still be followed by the real one
+    # one exit a day: an early exit is not replaced by a later punch
     r = one_day(day("08:00", "14:35", "14:50"), window_org, SUN)
-    assert (r.check_out, r.early) == (datetime(2026, 10, 25, 14, 50), 0) and "extra_punch" not in r.flags
+    assert (r.check_out, r.early) == (datetime(2026, 10, 25, 14, 35), 10) and "extra_punch" in r.flags
 
 
 def test_left_at_tells_the_kiosk_the_day_is_over(window_org):
     later = datetime(2026, 10, 25, 15, 50)
     for punches, left in ((("08:00", "14:50"), datetime(2026, 10, 25, 14, 50)),
-                          (("08:00", "14:35"), None),  # an early exit can be replaced
+                          (("08:00", "14:35"), datetime(2026, 10, 25, 14, 35)),  # one exit a day
                           (("08:00",), None)):
         e = day(*punches)
         _, rec = E.classify_new_punch(e, window_org, later)

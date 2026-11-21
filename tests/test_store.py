@@ -260,6 +260,15 @@ def test_upgrade_applies_new_rules_from_upgrade_day(tmp_path):
     assert db.scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'تطبيق قواعد الدوام الجديدة'") == 1
 
 
+def test_the_administration_opens_without_a_password(db):
+    db.users.logout()
+    user = db.users.enter()
+    assert user.role == "admin" and db.user == user
+    db.x("UPDATE users SET active = 0")  # even if every account was switched off
+    assert db.users.enter().role == "admin"
+    assert db.scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'فتح الإدارة'") == 2
+
+
 def test_upgrade_to_the_summary_report(tmp_path, monkeypatch):
     """From 1.3 (schema 4): no message per punch any more, and reports by name are not sent."""
     import hadir.db.store as store

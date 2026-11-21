@@ -1,4 +1,4 @@
-"""Settings, users, backup/restore and about."""
+"""Settings, backup/restore and about."""
 
 from __future__ import annotations
 
@@ -14,10 +14,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QF
 
 from ... import APP_SUBTITLE, APP_TITLE, __version__
 from ...core import maintenance
-from ...core.security import ROLES
 from ...core.settings import ENGINE_LABELS, LIVENESS_LABELS, SECURITY_LABELS
 from ...core.timeutil import Fmt, digits
-from ...db.store import StoreError
 from ...face import models
 from ...face.camera import list_cameras
 from ...notify import telegram
@@ -26,8 +24,7 @@ from ..admin import Page
 from ..theme import C, apply_theme
 from .schedules import RulesOverview
 from ..widgets.camera_view import CameraView
-from ..widgets.common import (DataTable, PageHeader, SpinBox, button, confirm, digit_locale, error,
-                              info, label)
+from ..widgets.common import PageHeader, SpinBox, button, confirm, digit_locale, error, info, label
 
 
 class _Job(QObject):
@@ -255,8 +252,9 @@ class SettingsPage(Page):
         outer = self.tabs.widget(self.tabs.count() - 1)._outer
         outer.insertWidget(0, label(
             "يرسل البرنامج إلى مجموعة أو قناة تلغرام ملخص الدوام في الساعات التي تحددها: صورة بالأعداد دون"
-            " أسماء (الحاضرون في الوقت والمتأخرون والغائبون وسبب الغياب والإجازات، لكل مجموعة). هذه الميزة وحدها"
-            " تحتاج إلى إنترنت: إن انقطع الاتصال يُحفظ الملخص ويُرسل عند عودته (حتى شهر)، وتنبّه الشاشة إلى"
+            " أسماء (الحاضرون في الوقت والمتأخرون والغائبون وسبب الغياب والإجازات، لكل مجموعة)، وتنبيهاً طارئاً"
+            " مع صورة من الكاميرا إذا حاول أحد تسجيل حضور زميله بوجهه على شاشة هاتف أو في صورة. هذه الميزة وحدها"
+            " تحتاج إلى إنترنت: إن انقطع الاتصال تُحفظ الرسائل وتُرسل عند عودته (حتى شهر)، وتنبّه الشاشة إلى"
             " ضرورة الاتصال بالإنترنت، ويبقى تسجيل الحضور يعمل كالمعتاد.", wrap=True))
         W["telegram.enabled"] = QCheckBox("تفعيل إشعارات تلغرام")
         W["telegram.enabled"].setChecked(bool(s["telegram.enabled"]))
@@ -281,6 +279,10 @@ class SettingsPage(Page):
         row.addWidget(W["telegram.chat_id"], 1)
         row.addWidget(find)
         f.addRow("معرّف المجموعة أو القناة:", row)
+        W["telegram.fraud_alerts"] = QCheckBox("تنبيه طارئ مع صورة من الكاميرا عند محاولة تزوير الحضور"
+                                               " (وجه زميل على شاشة هاتف أو في صورة)")
+        W["telegram.fraud_alerts"].setChecked(bool(s["telegram.fraud_alerts"]))
+        f.addRow("", W["telegram.fraud_alerts"])
         W["telegram.punches"] = QCheckBox("رسالة باسم الموظف عند كل تسجيل حضور أو انصراف"
                                           " (غير مستحسن مع كثرة الموظفين)")
         W["telegram.punches"].setChecked(bool(s["telegram.punches"]))
@@ -345,25 +347,6 @@ class SettingsPage(Page):
         r.addWidget(b2)
         r.addStretch(1)
         f.addRow("", r)
-
-        # users
-        w = QWidget()
-        ul = QVBoxLayout(w)
-        self.users = DataTable([("username", "اسم المستخدم", "text"), ("full_name", "الاسم", "text"),
-                                ("role_ar", "الصلاحية", "text"), ("state", "الحالة", "text"),
-                                ("last_login", "آخر دخول", "text")], stretch="full_name")
-        ul.addWidget(self.users, 1)
-        ur = QHBoxLayout()
-        for text, ic, fn in (("مستخدم جديد", "user_plus", self._new_user), ("تعديل", "edit", self._edit_user),
-                             ("تغيير كلمة المرور", "lock", self._password)):
-            b = button(text, ic)
-            b.clicked.connect(fn)
-            ur.addWidget(b)
-        ur.addStretch(1)
-        ul.addLayout(ur)
-        ul.addWidget(label("الصلاحيات: مدير النظام (كل شيء) — مشرف (الموظفون والإجازات والتصحيحات والتقارير)"
-                           " — مطّلع (العرض والتقارير فقط).", "Hint", wrap=True))
-        self.tabs.addTab(w, "المستخدمون")
 
         # about
         w = QWidget()
@@ -447,18 +430,15 @@ class SettingsPage(Page):
         elif self.db.settings.get("telegram.punches"):
             privacy = ("إشعارات تلغرام مفعّلة: يُرسل ملخص الدوام بالأعداد، ورسالة باسم الموظف وصفته وأوقاته"
                        " عند كل تسجيل، إلى مجموعة تلغرام المحددة فقط.")
+        elif self.db.settings.get("telegram.fraud_alerts"):
+            privacy = ("إشعارات تلغرام مفعّلة: يُرسل ملخص الدوام بالأعداد دون أسماء، وتنبيه مع صورة من الكاميرا"
+                       " عند محاولة تزوير الحضور، إلى مجموعة تلغرام المحددة فقط.")
         else:
             privacy = ("إشعارات تلغرام مفعّلة: يُرسل ملخص الدوام بالأعداد دون أسماء إلى مجموعة تلغرام"
                        " المحددة، ولا يُرسل غير ذلك.")
         self.about_lbl.setText(f"الإصدار {__version__} • يعمل دون إنترنت. {privacy}")
         last = self.db.settings.get("backup.last")
         self.last_backup.setText(digits(last[:16]) if last else "لم تُنشأ بعد")
-        rows = []
-        for u in self.db.users.list():
-            rows.append(dict(u) | {"role_ar": ROLES.get(u["role"], u["role"]),
-                                   "state": "فعّال" if u["active"] else "معطّل",
-                                   "last_login": digits((u["last_login"] or "")[:16])})
-        self.users.set_rows(rows)
         if self.tabs.tabText(self.tabs.currentIndex()) == "الكاميرا":
             self.cam_timer.start(33)
 
@@ -643,86 +623,3 @@ class SettingsPage(Page):
         win._allow_close = True
         win.close()
         sys.exit(0)
-
-    # ------------------------------------------------------------- users
-    def _new_user(self):
-        dlg = UserDialog(self.db, None, self)
-        if dlg.exec() == QDialog.Accepted:
-            self.refresh()
-
-    def _edit_user(self):
-        r = self.users.selected()
-        if r is None:
-            error(self, "اختر مستخدماً.")
-            return
-        dlg = UserDialog(self.db, r, self)
-        if dlg.exec() == QDialog.Accepted:
-            self.refresh()
-
-    def _password(self):
-        r = self.users.selected()
-        uid = r["id"] if r else self.db.user.id
-        dlg = QDialog(self)
-        dlg.setWindowTitle("تغيير كلمة المرور")
-        lay = QFormLayout(dlg)
-        p1, p2 = QLineEdit(), QLineEdit()
-        p1.setEchoMode(QLineEdit.Password)
-        p2.setEchoMode(QLineEdit.Password)
-        lay.addRow("كلمة المرور الجديدة:", p1)
-        lay.addRow("تأكيدها:", p2)
-        ok = QPushButton("حفظ")
-        ok.setProperty("kind", "primary")
-        ok.clicked.connect(dlg.accept)
-        lay.addRow("", ok)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        if p1.text() != p2.text():
-            error(self, "كلمتا المرور غير متطابقتين.")
-            return
-        try:
-            self.db.users.set_password(uid, p1.text())
-        except StoreError as exc:
-            error(self, str(exc))
-            return
-        info(self, "تم تغيير كلمة المرور.")
-
-
-class UserDialog(QDialog):
-    def __init__(self, db, row, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self.row = row
-        self.setWindowTitle("مستخدم")
-        lay = QFormLayout(self)
-        self.username = QLineEdit(row["username"] if row else "")
-        self.username.setEnabled(row is None)
-        self.full_name = QLineEdit(row["full_name"] if row else "")
-        self.role = combo(ROLES, row["role"] if row else "supervisor")
-        self.active = QCheckBox("فعّال")
-        self.active.setChecked(bool(row["active"]) if row else True)
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.Password)
-        lay.addRow("اسم المستخدم:", self.username)
-        lay.addRow("الاسم:", self.full_name)
-        lay.addRow("الصلاحية:", self.role)
-        lay.addRow("", self.active)
-        if row is None:
-            lay.addRow("كلمة المرور:", self.password)
-        ok = QPushButton("حفظ")
-        ok.setProperty("kind", "primary")
-        ok.clicked.connect(self.save)
-        lay.addRow("", ok)
-
-    def save(self):
-        try:
-            if self.row is None:
-                self.db.users.create(self.username.text(), self.full_name.text(), self.password.text(),
-                                     self.role.currentData())
-            else:
-                self.db.users.update(self.row["id"], self.full_name.text(), self.role.currentData(),
-                                     self.active.isChecked())
-        except StoreError as exc:
-            error(self, str(exc))
-            return
-        self.accept()
-

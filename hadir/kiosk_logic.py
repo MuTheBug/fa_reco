@@ -15,6 +15,23 @@ from .notify import telegram
 from .paths import snapshots_dir
 
 
+# Urgent alerts about a face shown on a phone (or a photo): the phone is usually tried again and
+# again, so one alert per impersonated employee in this time, and not too many in a day.
+ALERT_EVERY = 600  # seconds, per employee whose face was shown
+ALERT_GAP = 60  # seconds between any two alerts
+ALERTS_PER_DAY = 10
+
+
+@dataclass
+class FraudAlert:
+    """An urgent alert to send once the camera has taken a second picture (a moment later it
+    usually shows who was holding the phone)."""
+    employee_id: int
+    ts: datetime
+    frame: object = None  # what the camera saw at the attempt
+    box: object = None  # the face shown, in that picture
+
+
 @dataclass
 class KioskResult:
     kind: str  # punched | duplicate | left | early | closed | unknown | spoof | ambiguous | inactive | error
@@ -28,6 +45,7 @@ class KioskResult:
     ts: datetime | None = None
     punch_id: int | None = None
     adapted: bool = False
+    alert: FraudAlert | None = None  # to send to Telegram (see KioskLogic.send_alert)
 
 
 def _minutes_text(m: int) -> str:
@@ -97,22 +115,93 @@ def describe_day(rec: E.DayRecord, punch_type: str, ts: datetime) -> list[str]:
     return lines
 
 
+# Why someone leaves during the working day (the «تسجيل خروج» button of the administration).
+EXIT_REASONS = {
+    "hourly": "إجازة ساعية حتى نهاية الدوام",
+    "daily": "إجازة يومية",
+    "plain": "دون إجازة",
+}
+
+
+def exit_state(db: Database, employee_id: int, ts: datetime) -> tuple[E.DayRecord, str]:
+    """The employee's day, and why an exit cannot be recorded for them now ("" if it can)."""
+    [(_, [rec])] = db.compute([employee_id], ts.date(), ts.date(), now=ts)
+    if rec.shift is None or rec.status in (E.HOLIDAY, E.REST, E.LEAVE, E.INACTIVE, E.NO_SCHEDULE):
+        return rec, "لا دوام له اليوم."
+    if duty_block(rec) is not None:
+        return rec, "النوبة المتصلة تنتهي ببصمتها عند نهاية النوبة؛ سجّل الإجازة من صفحة «الإجازات»."
+    if rec.check_out is not None:
+        return rec, f"سُجّل انصرافه اليوم الساعة {fmt_time(rec.check_out)}؛ لا يُسجَّل خروج ثانٍ."
+    if rec.check_in is None:
+        return rec, "لم يسجّل حضوراً اليوم."
+    if ts < rec.check_in:
+        return rec, f"وقت الخروج قبل حضوره ({fmt_time(rec.check_in)})."
+    return rec, ""
+
+
+def record_exit(db: Database, employee_id: int, ts: datetime, reason: str, leave_type_id: int | None = None,
+                note: str = "") -> int:
+    """Record an exit punch for someone leaving now, with its reason: an hourly leave until the
+    end of their working time, a whole day of leave, or none (the day's rules then apply)."""
+    from .db.store import StoreError
+
+    rec, why = exit_state(db, employee_id, ts)
+    if why:
+        raise StoreError(why)
+    note = note.strip()
+    with db.tx():
+        if reason == "hourly" and ts < rec.shift.end:
+            db.leaves.add(employee_id, leave_type_id, ts.date(), start_time=ts.time().replace(second=0, microsecond=0),
+                          end_time=rec.shift.end.time(), note=note or "خروج أثناء الدوام")
+        elif reason == "daily":
+            db.leaves.add(employee_id, leave_type_id, ts.date(), note=note or "خروج أثناء الدوام")
+        elif reason not in EXIT_REASONS:
+            raise StoreError("اختر سبب الخروج.")
+        text = f"تسجيل خروج أثناء الدوام: {EXIT_REASONS[reason]}" + (f" — {note}" if note else "")
+        return db.punches.add_manual(employee_id, ts, "out", text)
+
+
 class KioskLogic:
-    def __init__(self, db: Database, engine: FaceEngine | None = None):
+    def __init__(self, db: Database, engine: FaceEngine | None = None, clock=time.monotonic):
         self.db = db
         self.engine = engine
+        self.clock = clock
         self._last_unknown_event = 0.0
+        self._alerted: dict[int, float] = {}  # employee id -> when an alert was last made
 
     def settings(self, key):
         return self.db.settings.get(key)
 
-    def _snapshot(self, frame, box, ts: datetime, tag: str) -> str | None:
+    def _snapshot(self, frame, box, ts: datetime, tag: str, wide: bool = False) -> str | None:
         if frame is None or box is None or not self.settings("kiosk.save_snapshots"):
             return None
         try:
-            return save_snapshot(snapshots_dir(), frame, box, ts, tag)
+            return save_snapshot(snapshots_dir(), frame, box, ts, tag, wide=wide)
         except OSError:
             return None
+
+    def _fraud_alert(self, decision: Decision, frame, ts: datetime) -> FraudAlert | None:
+        """The urgent alert for this attempt, unless one was made for it moments ago."""
+        eid = decision.employee_id
+        if eid is None or not telegram.alerts_on(self.db):
+            return None
+        now = self.clock()
+        if now - self._alerted.get(eid, -1e12) < ALERT_EVERY:
+            return None  # the same phone tried again
+        if self._alerted and now - max(self._alerted.values()) < ALERT_GAP:
+            return None
+        if telegram.alerts_since(self.db, datetime.combine(ts.date(), datetime.min.time())) >= ALERTS_PER_DAY:
+            return None  # the security log keeps every attempt
+        self._alerted[eid] = now
+        best = decision.best
+        if best is not None and best.frame is not None:
+            return FraudAlert(eid, ts, best.frame, best.face.box)
+        return FraudAlert(eid, ts, frame, None)
+
+    def send_alert(self, alert: FraudAlert, later=None) -> int:
+        """Queue the urgent alert, with the camera's picture a moment later if there is one."""
+        return telegram.queue_alert(self.db, self.db.employees.get(alert.employee_id), alert.ts,
+                                    alert.frame, alert.box, later)
 
     def register(self, employee_id: int, ts: datetime, *, source: str = "face",
                  score: float | None = None, liveness: float | None = None, frame=None,
@@ -188,12 +277,20 @@ class KioskLogic:
                     res.adapted = False
             return res
         if decision.kind == "spoof":
-            snap = self._snapshot(frame, box, ts, "spoof")
+            # A colleague's face on a phone (a video can turn its head) or a photo: refused,
+            # kept with a wide picture (the phone shows), and an urgent alert goes to Telegram.
+            snap = self._snapshot(frame, box, ts, "spoof", wide=True)
             name = self.db.employees.names().get(decision.employee_id, "")
-            self.db.events.add("spoof", f"محاولة تسجيل بصورة أو شاشة (تشبه: {name})" if name else
-                               "محاولة تسجيل بصورة أو شاشة", decision.employee_id, snap)
-            return KioskResult("spoof", "bad", "تعذّر التحقق من أنك أمام الكاميرا فعلاً",
-                               ["لا تستخدم صورة أو هاتفاً — قف بنفسك أمام الكاميرا"])
+            alert = self._fraud_alert(decision, frame, ts)
+            text = f"محاولة تسجيل بوجه على شاشة هاتف أو في صورة (يشبه: {name})" if name else \
+                "محاولة تسجيل بوجه على شاشة هاتف أو في صورة"
+            self.db.events.add("spoof", text + (" — أُرسل تنبيه طارئ إلى تلغرام" if alert else ""),
+                               decision.employee_id, snap)
+            lines = ["لا تستخدم صورة أو هاتفاً — قف بنفسك أمام الكاميرا"]
+            if alert is not None:
+                lines.append("سُجّلت هذه المحاولة وأُبلغت الإدارة")
+            return KioskResult("spoof", "bad", "تعذّر التحقق من أنك أمام الكاميرا فعلاً", lines,
+                               ts=ts, alert=alert)
         if decision.kind == "ambiguous":
             snap = self._snapshot(frame, box, ts, "ambiguous")
             names = self.db.employees.names()

@@ -1,17 +1,21 @@
 """Telegram notifications: a summary of the day's attendance as a picture (numbers, no names) at
-chosen times, and optionally a message for every check-in/check-out.
+chosen times, an urgent alert with a camera picture when someone tries to cheat the attendance
+(a colleague's face shown on a phone, or a photo), and optionally a message for every
+check-in/check-out.
 
 This is the only feature that uses the internet, and it is off until an administrator enters
 a bot token and the id of a group or channel.  Messages are first stored in the database
 (``outbox``) and a background thread sends them, so the attendance screen never waits for the
-network and nothing is lost while the computer is offline: reports wait up to a month, and the
-screen reminds people to connect the computer to the internet while they wait.
+network and nothing is lost while the computer is offline: reports and alerts wait up to a month
+(alerts go first), and the screen reminds people to connect the computer to the internet while
+they wait.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from html import escape
 import re
 import threading
 import urllib.error
@@ -20,7 +24,7 @@ import uuid
 from datetime import date, datetime, time, timedelta
 
 from ..core import engine as E
-from ..core.timeutil import digits, fmt_date, fmt_time, parse_dt, weekday_name
+from ..core.timeutil import digits, fmt_date, fmt_time, iso_dt, parse_dt, weekday_name
 from . import summary as S
 
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -111,7 +115,9 @@ def send_photo(token: str, chat_id: str, photo: bytes, caption: str = "", html: 
     payload = {"chat_id": str(chat_id).strip(), "caption": caption}
     if html:
         payload["parse_mode"] = "HTML"
-    call(token, "sendPhoto", payload, timeout=60, files={"photo": ("summary.png", photo, "image/png")})
+    jpeg = photo[:2] == b"\xff\xd8"  # camera pictures; the summary is a PNG
+    name, ctype = ("camera.jpg", "image/jpeg") if jpeg else ("summary.png", "image/png")
+    call(token, "sendPhoto", payload, timeout=60, files={"photo": (name, photo, ctype)})
 
 
 def deliver(token: str, chat_id: str, text: str, photo: bytes | None = None, html: bool = False) -> None:
@@ -177,6 +183,54 @@ def punch_text(emp, punch_type: str, rec: E.DayRecord, ts: datetime) -> str:
     return "\n".join(lines)
 
 
+def alerts_on(db) -> bool:
+    """Urgent alerts about attempts to cheat the attendance (on unless switched off)."""
+    return enabled(db) and bool(db.settings.get("telegram.fraud_alerts"))
+
+
+def alert_text(db, emp, ts: datetime, with_picture: bool = True) -> str:
+    """The caption of the urgent alert (HTML): whose face was shown, when, and where."""
+    who = escape(emp["full_name"])
+    if emp["job_title"]:
+        who += f" — {escape(emp['job_title'])}"
+    if emp["code"]:
+        who += f" (الرقم الوظيفي {escape(emp['code'])})"
+    lines = ["🚨 <b>تنبيه طارئ: محاولة تزوير حضور</b>",
+             "عُرض أمام كاميرا الحضور وجهٌ على شاشة هاتف أو في صورة بدل حضور الشخص نفسه،"
+             " فرفض البرنامج تسجيله.",
+             f"<b>الوجه المعروض يشبه:</b> {who}",
+             f"<b>الوقت:</b> {weekday_name(ts.date())} {fmt_date(ts.date())} الساعة {fmt_time(ts)}"]
+    org = db.settings.get("org.name")
+    if org:
+        lines.append(f"<b>الدائرة:</b> {escape(org)}")
+    if with_picture:
+        lines.append("في الصورة: لحظة المحاولة، ثم من كان أمام الكاميرا بعدها بثانيتين.")
+    return "\n".join(lines)
+
+
+def alert_picture(frame, box, later, ts: datetime, org: str) -> bytes | None:
+    try:
+        from .alert import render_alert
+
+        return render_alert(frame, box, later, ts, org)
+    except Exception:
+        log.exception("telegram: drawing the alert picture")
+        return None
+
+
+def alerts_since(db, start: datetime) -> int:
+    return db.scalar("SELECT COUNT(*) FROM outbox WHERE kind = 'alert' AND created_at >= ?", (iso_dt(start),))
+
+
+def queue_alert(db, emp, ts: datetime, frame=None, box=None, later=None) -> int:
+    """Queue the urgent alert with the camera's pictures; returns 1 (0 when switched off)."""
+    if not alerts_on(db) or emp is None:
+        return 0
+    photo = alert_picture(frame, box, later, ts, db.settings.get("org.name")) if frame is not None else None
+    db.outbox.add("alert", alert_text(db, emp, ts, photo is not None), photo=photo)
+    return 1
+
+
 def queue_punch(db, emp, punch_type: str, rec: E.DayRecord, ts: datetime) -> None:
     if enabled(db) and db.settings.get("telegram.punches"):
         db.outbox.add("punch", punch_text(emp, punch_type, rec, ts))
@@ -215,10 +269,11 @@ def waiting_alert(db, now: datetime) -> str:
     oldest = parse_dt(w["oldest"])
     since = (f"الساعة {fmt_time(oldest)}" if oldest.date() == now.date()
              else f"{weekday_name(oldest.date())} {fmt_date(oldest.date())}")
+    what = "تقارير الدوام وتنبيهاته" if w["alerts"] else "تقارير الدوام"
     if not w["error"] or w["error"] == NETWORK_ERROR:
-        return (f"لا يوجد اتصال بالإنترنت: تقارير الدوام بانتظار الإرسال إلى تلغرام ({digits(w['count'])})"
+        return (f"لا يوجد اتصال بالإنترنت: {what} بانتظار الإرسال إلى تلغرام ({digits(w['count'])})"
                 f" منذ {since}. صِل الجهاز بالإنترنت وستُرسل تلقائياً.")
-    return (f"تعذّر إرسال تقارير الدوام إلى تلغرام ({digits(w['count'])}) منذ {since}: {w['error']}"
+    return (f"تعذّر إرسال {what} إلى تلغرام ({digits(w['count'])}) منذ {since}: {w['error']}"
             " راجع إعدادات تلغرام.")
 
 
@@ -297,7 +352,8 @@ class Sender(threading.Thread):
             return 0
         if db.outbox.drop_older_than(now - timedelta(days=GIVE_UP_DAYS), "punch"):
             db.events.add("telegram", f"أُهملت رسائل لم يمكن إرسالها خلال {digits(GIVE_UP_DAYS)} أيام")
-        if db.outbox.drop_older_than(now - timedelta(days=REPORT_KEEP_DAYS), "report"):
+        if (db.outbox.drop_older_than(now - timedelta(days=REPORT_KEEP_DAYS), "report")
+                + db.outbox.drop_older_than(now - timedelta(days=REPORT_KEEP_DAYS), "alert")):
             db.events.add("telegram", f"أُهملت تقارير لم يمكن إرسالها خلال {digits(REPORT_KEEP_DAYS)} يوماً")
         token, chat = db.settings.get("telegram.token"), db.settings.get("telegram.chat_id")
         sent = 0
@@ -305,7 +361,7 @@ class Sender(threading.Thread):
             if self._stop_event.is_set():
                 break
             try:
-                self.transport(token, chat, m["text"], m["photo"], m["kind"] == "report")
+                self.transport(token, chat, m["text"], m["photo"], m["kind"] in ("report", "alert"))
             except TelegramError as exc:
                 db.outbox.mark_failed(m["id"], str(exc))
                 self._failures += 1

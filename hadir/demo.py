@@ -118,9 +118,7 @@ def populate(db: Database, today: date, employees: int = 24, days: int = 35, see
 def demo_database(path, today: date | None = None, **kw) -> Database:
     today = today or date.today()
     db = Database(path, clock=lambda: datetime.combine(today, datetime.min.time()).replace(hour=10, minute=30))
-    if not db.users.count():
-        db.users.create("admin", "مدير النظام", "admin123", "admin")
-    db.users.authenticate("admin", "admin123")
+    db.users.enter()  # no passwords
     db.settings.set("org.name", "دائرة تجريبية")
     db.settings.set("org.subtitle", "قسم الموارد البشرية")
     populate(db, today, **kw)

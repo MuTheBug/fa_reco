@@ -37,6 +37,42 @@ def _excepthook(exc_type, exc, tb):
         pass
 
 
+# Where Linux distributions keep the certificates of the authorities that sign web sites.
+CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt",  # Arch, EndeavourOS, Debian, Ubuntu
+              "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora
+              "/etc/ssl/ca-bundle.pem",  # openSUSE
+              "/etc/ssl/cert.pem")
+
+
+def use_system_certificates(candidates=CA_BUNDLES) -> str:
+    """Let a Linux build reach Telegram over HTTPS: it carries its own OpenSSL, which looks for
+    the certificates where the build machine keeps them; point it to this system's instead."""
+    import ssl
+
+    if not sys.platform.startswith("linux") or os.environ.get("SSL_CERT_FILE"):
+        return ""
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile and os.path.isfile(paths.cafile):
+        return ""
+    for path in candidates:
+        if os.path.isfile(path):
+            os.environ["SSL_CERT_FILE"] = path
+            return path
+    return ""
+
+
+def system_libraries_for_children() -> None:
+    """A Linux build points LD_LIBRARY_PATH at its own libraries; programs it starts (the sound
+    player, the file manager that opens a report) must use the system's own, as before."""
+    if not (getattr(sys, "frozen", False) and sys.platform.startswith("linux")):
+        return
+    original = os.environ.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original is not None:
+        os.environ["LD_LIBRARY_PATH"] = original
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+
+
 def _qt_app(argv):
     from PySide6.QtCore import QLibraryInfo, QLocale, Qt, QTranslator
     from PySide6.QtGui import QIcon
@@ -50,6 +86,7 @@ def _qt_app(argv):
     app = QApplication.instance() or QApplication(argv)
     app.setApplicationName(APP_TITLE)
     app.setApplicationVersion(__version__)
+    app.setDesktopFileName("hadir")  # Linux: the taskbar shows the icon of hadir.desktop
     app.setLayoutDirection(Qt.RightToLeft)
     QLocale.setDefault(QLocale(QLocale.Arabic, QLocale.Iraq))
     app._translators = []
@@ -145,11 +182,11 @@ def start_again() -> None:
         cmd = [sys.executable, "-m", "hadir", *sys.argv[1:]]
     env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # a new instance, not a child
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen(cmd, env=env, close_fds=True, creationflags=flags)
+    subprocess.Popen(cmd, env=env, close_fds=True, creationflags=flags, start_new_session=os.name == "posix")
 
 
 def selftest(args) -> int:
-    """Headless check used by the Windows build: models, database, reports."""
+    """Headless check used by the Windows and Linux builds: models, database, reports."""
     import tempfile
     from datetime import date, datetime, time
 
@@ -183,8 +220,12 @@ def selftest(args) -> int:
     out.append(f"engine ok, faces on blank frame: {len(a.faces)}")
     import ssl  # Telegram notifications need HTTPS with the system certificates
 
-    ssl.create_default_context()
-    out.append(f"ssl ok: {ssl.OPENSSL_VERSION}")
+    authorities = ssl.create_default_context().cert_store_stats()["x509_ca"]
+    out.append(f"ssl ok: {ssl.OPENSSL_VERSION}, {authorities} certificate authorities"
+               f"{' from ' + os.environ['SSL_CERT_FILE'] if os.environ.get('SSL_CERT_FILE') else ''}")
+    if authorities == 0 and sys.platform.startswith("linux"):
+        out.append("no certificate authorities found: Telegram could not be reached")
+        return finish(4)
     if args.selftest_image:
         img = cv2.imread(args.selftest_image)
         a = engine.analyze(img, embed=True)
@@ -243,6 +284,8 @@ def main(argv=None) -> int:
     ap.add_argument("--selftest-image", default="", help=argparse.SUPPRESS)
     ap.add_argument("--selftest-out", default="", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    use_system_certificates()
+    system_libraries_for_children()
     if args.data_dir:
         os.environ["HADIR_DATA_DIR"] = args.data_dir
     elif args.demo:

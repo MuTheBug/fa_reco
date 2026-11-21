@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from .schema import (ADMIN_GROUP, DEFAULT_GROUPS, GUARD_RULES, SEED_END, SEED_RULES, SEED_SCHEDULE,
-                     SEED_START, rotation_anchor)
+from .schema import (ADMIN_GROUP, DEFAULT_GROUPS, GUARD_RULES, SEED_RULES, SEED_SCHEDULE, rotation_anchor,
+                     seed_days, seed_far_days)
 from .store import Database
 
 DEFAULT_LEAVE_TYPES = [
@@ -25,11 +25,9 @@ def seed_defaults(db: Database) -> None:
             for t in DEFAULT_LEAVE_TYPES:
                 db.leaves.save_type(t)
         if not db.scalar("SELECT COUNT(*) FROM schedules"):
-            work = (True, SEED_START, SEED_END)
-            off = (False, None, None)
             # index = date.weekday(): Mon..Sun; Friday and Saturday are the weekend.
-            days = [work, work, work, work, off, off, work]
-            sid = db.schedules.save(dict(name=SEED_SCHEDULE, kind="weekly", days=days, **SEED_RULES))
+            sid = db.schedules.save(dict(name=SEED_SCHEDULE, kind="weekly", days=seed_days(), far=True,
+                                         far_days=seed_far_days(), **SEED_RULES))
             if not db.scalar("SELECT COUNT(*) FROM emp_groups"):
                 gid = db.groups.save(ADMIN_GROUP, "الدوام الرسمي")
                 db.groups.assign_schedule(gid, sid, "2000-01-01")

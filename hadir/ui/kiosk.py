@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from datetime import datetime
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
@@ -13,13 +14,16 @@ from PySide6.QtWidgets import (QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel
 from ..core.settings import SECURITY_LEVELS
 from ..face.pipeline import Status
 from ..core.timeutil import digits, fmt_date_long, fmt_time, parse_dt
-from ..kiosk_logic import KioskResult
+from ..kiosk_logic import FraudAlert, KioskResult
 from .sound import play
 from .theme import C, FONT_FAMILY, icon, pixmap
 from .widgets.camera_view import CameraView
 from .widgets.common import AlertBar, error
 
 TONE_COLORS = {"ok": "#16a34a", "warn": "#d97706", "bad": "#dc2626"}
+ALERT_LATER_MS = 2000  # the second picture of an attempt: who was holding the phone
+
+log = logging.getLogger("hadir")
 
 
 def round_pixmap(data: bytes | None, size: int) -> QPixmap | None:
@@ -288,6 +292,18 @@ class KioskScreen(QWidget):
         self.show_result(res)
         if res.adapted:
             self.ctx.worker.reload_galleries()
+        if res.alert is not None:
+            QTimer.singleShot(ALERT_LATER_MS, lambda a=res.alert: self.send_alert(a))
+
+    def send_alert(self, alert: FraudAlert):
+        """Send the urgent alert with a second picture taken now (the phone is usually lowered
+        once the screen refuses it, showing who was holding it)."""
+        frame, _ = self.ctx.camera.latest()
+        try:
+            if self.ctx.logic.send_alert(alert, None if frame is None else frame.copy()) and self.ctx.telegram:
+                self.ctx.telegram.wake()
+        except Exception:  # never let the kiosk crash on an alert
+            log.exception("kiosk: queueing the fraud alert")
 
     def show_result(self, res: KioskResult):
         photo = self.ctx.db.employees.photo(res.employee_id) if res.employee_id else None

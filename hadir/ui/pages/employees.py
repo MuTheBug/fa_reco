@@ -10,8 +10,8 @@ from openpyxl import Workbook, load_workbook
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QProgressBar, QTabWidget, QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
+                               QPushButton, QTabWidget, QVBoxLayout, QWidget)
 
 from ...core.settings import SECURITY_LEVELS
 from ...core.timeutil import digits, fmt_time, parse_date, parse_time
@@ -23,11 +23,11 @@ from ..theme import C, icon
 from ..widgets.camera_view import CameraView
 from ..widgets.common import (Card, DataTable, DateEdit, PageHeader, SearchBox, TimeEdit, button,
                               confirm, error, info, label)
-from .schedules import day_limits, plus_minutes, schedule_summary
+from .schedules import day_limits, far_differences, plus_minutes, schedule_summary
 
 POSE_LABELS = {"front": "أمامي", "left": "يسار", "right": "يمين", "up": "للأعلى", "down": "للأسفل",
                "photo": "صورة", "auto": "تحديث تلقائي"}
-IMPORT_HEADERS = ["الاسم", "رقم الهاتف", "الصفة الوظيفية", "المجموعة"]
+IMPORT_HEADERS = ["الاسم", "رقم الهاتف", "الصفة الوظيفية", "المجموعة", "السكن"]
 # Column names used by the import template of version 1.0.
 HEADER_ALIASES = {"الهاتف": "رقم الهاتف", "العنوان الوظيفي": "الصفة الوظيفية"}
 
@@ -53,6 +53,13 @@ class EmployeesPage(Page):
         tpl = button("نموذج الاستيراد", "download", "ghost")
         tpl.clicked.connect(self.save_template)
         header.add(tpl)
+        out = button("تصدير الموظفين", "download")
+        out.setToolTip("Excel أو CSV؛ يمكن تعديل الملف ثم استيراده من جديد")
+        out.clicked.connect(self.export_employees)
+        header.add(out)
+        punches = button("تصدير البصمات", "download")
+        punches.clicked.connect(self.export_punches)
+        header.add(punches)
 
         card = Card()
         tools = QHBoxLayout()
@@ -70,7 +77,7 @@ class EmployeesPage(Page):
         self.table = DataTable([
             ("code", "الرقم الوظيفي", "text"), ("full_name", "الاسم", "text"),
             ("job_title", "الصفة الوظيفية", "text"), ("phone", "رقم الهاتف", "text"),
-            ("group_name", "المجموعة", "text"), ("face", "بصمة الوجه", "text"),
+            ("group_name", "المجموعة", "text"), ("home", "السكن", "text"), ("face", "بصمة الوجه", "text"),
             ("state", "الحالة", "text")], stretch="full_name")
         self.table.setMinimumHeight(420)
         self.table.activated_row.connect(lambda r: self.edit(r["id"]))
@@ -111,6 +118,7 @@ class EmployeesPage(Page):
             n = e["samples"]
             r["face"] = f"{digits(n)} عينة" if n else "غير مسجّل"
             r["state"] = "فعّال" if e["active"] else "غير فعّال"
+            r["home"] = "بعيد" if e["far"] else "قريب"
             r["_tones"] = {"face": "warn" if not n else ("ok" if n >= 8 else "")}
             if not e["active"]:
                 r["_tone"] = "muted"
@@ -162,6 +170,41 @@ class EmployeesPage(Page):
             self.ctx.worker.reload_galleries()
         self.reload()
 
+    # -------------------------------------------------------------- export
+    def _save_path(self, title: str, name: str) -> str:
+        path, chosen = QFileDialog.getSaveFileName(self, title, name, "Excel (*.xlsx);;CSV (*.csv)")
+        if path and not path.lower().endswith((".xlsx", ".csv")):
+            path += ".csv" if chosen.startswith("CSV") else ".xlsx"
+        return path
+
+    def export_employees(self):
+        from ...reports.exports import export_employees
+
+        path = self._save_path("تصدير الموظفين", "الموظفون.xlsx")
+        if path:
+            try:
+                n = export_employees(self.db, path)
+            except OSError as exc:
+                error(self, f"تعذّر حفظ الملف: {exc}")
+                return
+            info(self, f"صُدِّر {digits(n)} موظفاً.")
+
+    def export_punches(self):
+        from ...reports.exports import export_punches
+
+        dlg = PeriodDialog(self.db.now().date(), self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        start, end = dlg.period()
+        path = self._save_path("تصدير البصمات", f"البصمات_{start:%Y-%m-%d}_{end:%Y-%m-%d}.xlsx")
+        if path:
+            try:
+                n = export_punches(self.db, start, end, path)
+            except OSError as exc:
+                error(self, f"تعذّر حفظ الملف: {exc}")
+                return
+            info(self, f"صُدِّرت {digits(n)} بصمة.")
+
     # -------------------------------------------------------------- Excel
     def save_template(self):
         path, _ = QFileDialog.getSaveFileName(self, "حفظ نموذج الاستيراد", "نموذج_الموظفين.xlsx",
@@ -174,8 +217,8 @@ class EmployeesPage(Page):
         ws.sheet_view.rightToLeft = True
         ws.append(IMPORT_HEADERS)
         ws.append(["أحمد علي حسن", "07701234567", "محاسب", self.db.groups.names().get(
-            self.db.employees.default_group(), "")])
-        for col in "ABCD":
+            self.db.employees.default_group(), ""), "قريب"])
+        for col in "ABCDE":
             ws.column_dimensions[col].width = 26
         for r in range(2, 502):
             ws.cell(row=r, column=2).number_format = "@"  # keep the leading zero of phone numbers
@@ -224,6 +267,12 @@ class EmployeesPage(Page):
             for h, key in (("رقم الهاتف", "phone"), ("الصفة الوظيفية", "job_title")):
                 if h in col:
                     data[key] = get(h)
+            home = get("السكن")
+            if home:
+                if home not in ("قريب", "بعيد"):
+                    problems.append(f"الصف {n}: السكن «{home}» غير معروف؛ اكتب «قريب» أو «بعيد»")
+                else:
+                    data["far"] = home == "بعيد"
             gname = get("المجموعة")
             if gname and gname not in groups:
                 problems.append(f"الصف {n}: المجموعة «{gname}» غير موجودة؛ وُضع في المجموعة الافتراضية")
@@ -248,6 +297,33 @@ class EmployeesPage(Page):
 
 
 # ---------------------------------------------------------------------------
+class PeriodDialog(QDialog):
+    """From which day to which day (the current month so far by default)."""
+
+    def __init__(self, today, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("تصدير البصمات")
+        lay = QFormLayout(self)
+        self.start = DateEdit(today.replace(day=1))
+        self.end = DateEdit(today)
+        lay.addRow("من:", self.start)
+        lay.addRow("إلى:", self.end)
+        ok = QPushButton("تصدير")
+        ok.setProperty("kind", "primary")
+        ok.clicked.connect(self._ok)
+        lay.addRow("", ok)
+
+    def period(self):
+        return self.start.value(), self.end.value()
+
+    def _ok(self):
+        start, end = self.period()
+        if end < start:
+            error(self, "تاريخ النهاية قبل تاريخ البداية.")
+            return
+        self.accept()
+
+
 class EmployeeDialog(QDialog):
     def __init__(self, ctx, employee_id: int | None, parent=None):
         super().__init__(parent)
@@ -315,6 +391,15 @@ class EmployeeDialog(QDialog):
         cl.addWidget(self.cycle_start)
         cl.addWidget(self.cycle_hint, 1)
         form.addRow("أول يوم نوبة:", self.cycle_row)
+        # Those who live far away follow their schedule's own days (e.g. a later Sunday).
+        self.far = QCheckBox("يسكن بعيداً عن الدائرة")
+        self.far_hint = label("", "Hint", wrap=True)
+        self.far_row = QWidget()
+        fr = QVBoxLayout(self.far_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.addWidget(self.far)
+        fr.addWidget(self.far_hint)
+        form.addRow("السكن:", self.far_row)
         # Own start and exit times: lateness, absence and the exit window follow them.
         self.own = QCheckBox("أوقات دوام خاصة بهذا الموظف")
         self.own_start = TimeEdit(time(8, 0))
@@ -437,6 +522,7 @@ class EmployeeDialog(QDialog):
         self.phone.setText(e["phone"])
         self.job.setText(e["job_title"])
         self.active.setChecked(bool(e["active"]))
+        self.far.setChecked(bool(e["far"]))
         self.code_hint.setText(f"الرقم الوظيفي للتسجيل بالرمز السري: {e['code']}")
         self._orig_group = e["group_id"]
         self.group.setCurrentIndex(max(0, self.group.findData(e["group_id"])))
@@ -461,6 +547,9 @@ class EmployeeDialog(QDialog):
         sched = self.db.groups.current_schedule(gid) if gid else None
         rotation = sched is not None and sched["kind"] == "cycle"
         self.form.setRowVisible(self.cycle_row, rotation)
+        far = self.db.schedules.get(sched["id"]) if sched is not None and sched["far"] else None
+        self.form.setRowVisible(self.far_row, far is not None)
+        self.far_hint.setText(f"للساكنين بعيداً — {far_differences(far)}" if far is not None else "")
         if rotation:
             self.cycle_hint.setText(schedule_summary(self.db, sched["id"]))
             if not self._cycle_set and sched["cycle_anchor"]:
@@ -548,6 +637,7 @@ class EmployeeDialog(QDialog):
             data["group_id"] = group
         if self.form.isRowVisible(self.cycle_row):
             data["cycle_start"] = self.cycle_start.value()
+        data["far"] = self.far.isChecked() and self.form.isRowVisible(self.far_row)
         own = self.own.isChecked()
         data["own_start"] = self.own_start.value() if own else None
         data["own_end"] = self.own_end.value() if own else None

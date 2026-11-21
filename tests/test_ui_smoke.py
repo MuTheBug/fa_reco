@@ -78,14 +78,23 @@ def test_schedule_dialog_round_trip(window):
     sunday = data["days"][6]
     assert sunday[0] and sunday[1].strftime("%H:%M") == "08:00" and sunday[2].strftime("%H:%M") == "14:45"
     assert not data["days"][4][0]  # Friday off
-    assert next(r for r in dlg.rows if r.index == 6).hint.text() == (
-        "لا تأخير حتى 08:30 • غياب بعد 09:00 • الخروج من 14:30")
+    row = next(r for r in dlg.rows if r.index == 6)
+    assert (row.on_time.value().strftime("%H:%M"), row.absent.value().strftime("%H:%M")) == ("08:30", "09:00")
+    assert row.hint.text() == "الخروج من 14:30" and data["days"][3][2].strftime("%H:%M") == "14:30"
+    # those who live far away: Sunday without lateness or absence until 10:00, Thursday until 14:00
+    assert dlg.far_enabled.isChecked() and data["far"]
+    far_sunday = next(r for r in dlg.far_rows if r.index == 6)
+    assert (far_sunday.on_time.value().strftime("%H:%M"), far_sunday.absent.value().strftime("%H:%M")) == (
+        "10:00", "10:00") and "حدود خاصة" in far_sunday.hint.text()
+    assert data["far_days"][6][2:] == (120, 120) and data["far_days"][3][1].strftime("%H:%M") == "14:00"
     # the department's rules survive opening and saving the editor
     assert (data["grace_late"], data["absent_after"], data["exit_until"].strftime("%H:%M")) == (30, 60, "17:00")
     assert data["early_absent"] is True and data["missing_absent"] is True
     dlg.save()
     s = db.schedules.get(sid)
     assert (s.grace_late, s.absent_after, s.early_absent, s.missing_absent) == (30, 60, True, True)
+    assert s.far_days[6].grace == s.far_days[6].absent == 120 and s.far_days[3].end.strftime("%H:%M") == "14:00"
+    assert s.days[6].grace is None and s.days[3].end.strftime("%H:%M") == "14:30"  # kept as they were
 
 
 def test_settings_show_the_rules_day_by_day(window, qapp):
@@ -146,6 +155,30 @@ def test_kiosk_shows_result(window, qapp):
     assert window.kiosk.result.isVisibleTo(window.kiosk) and res.kind == "punched"
     again = KioskLogic(db).register(emp, datetime(2026, 10, 28, 10, 31))
     assert again.kind == "duplicate"
+
+
+def test_kiosk_sends_the_fraud_alert_after_a_moment(window, qapp, monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from hadir.face.pipeline import Decision
+    from hadir.ui import kiosk as K
+
+    db = window.ctx.db
+    db.settings.set_many({"telegram.enabled": True, "telegram.token": "1:A", "telegram.chat_id": "-1"})
+    emp = db.scalar("SELECT id FROM employees")
+    frame = np.full((360, 640, 3), 128, np.uint8)
+    best = SimpleNamespace(frame=frame, face=SimpleNamespace(box=(250.0, 100.0, 140.0, 160.0)))
+    later = []
+    monkeypatch.setattr(K.QTimer, "singleShot", lambda ms, fn: later.append((ms, fn)))
+    window.kiosk._on_decision(Decision("spoof", emp, 0.8, liveness=0.02, best=best), frame)
+    assert window.kiosk.result.isVisibleTo(window.kiosk)
+    assert [ms for ms, _ in later] == [K.ALERT_LATER_MS] and not db.outbox.pending()
+    later[0][1]()  # two seconds later (no camera here: the first picture alone)
+    [m] = db.outbox.pending()
+    assert m["kind"] == "alert" and m["photo"][:2] == b"\xff\xd8" and isinstance(datetime.now(), datetime)
 
 
 def test_time_fields_are_not_mirrored(qapp):
@@ -278,3 +311,56 @@ def test_summary_preview_shows_the_picture(window, qapp, monkeypatch):
     page._tg_show_preview()  # today's summary (or a note that nobody works today)
     if getattr(page, "preview", None) is not None:
         page.preview.close()
+
+
+def test_no_passwords_anywhere(window, qapp, tmp_path, monkeypatch):
+    from hadir.db.store import Database
+    from hadir.ui import dialogs, main_window
+
+    db = window.ctx.db
+    db.users.logout()
+    window.start()
+    window.in_kiosk = True
+    window.request_admin()  # no login dialog
+    assert not window.in_kiosk and db.user is not None and db.user.role == "admin"
+    assert window.stack.currentWidget() is window.admin
+    assert not hasattr(window.admin, "logout_requested")
+    assert "المستخدمون" not in [window.admin.page("settings").tabs.tabText(i)
+                                for i in range(window.admin.page("settings").tabs.count())]
+    # closing the attendance screen only asks for confirmation
+    window.show_kiosk()
+    asked = []
+    monkeypatch.setattr(main_window, "confirm", lambda *a, **k: asked.append(a[1]) or False)
+    assert window.isVisible()
+    window.close()
+    assert asked and "إغلاق" in asked[0] and window.isVisible()  # declined: still open
+    # the first run asks only for the organisation
+    fresh = Database(tmp_path / "first.db")
+    dlg = dialogs.FirstRunDialog(fresh)
+    dlg.org.setText("دائرة جديدة")
+    dlg._create()
+    assert fresh.users.count() == 1 and fresh.user is not None and fresh.settings.get("org.name") == "دائرة جديدة"
+    fresh.close()
+
+
+def test_the_employee_form_asks_who_lives_far_away(window, qapp, monkeypatch):
+    from hadir.ui.pages import employees
+
+    db = window.ctx.db
+    dlg = employees.EmployeeDialog(window.ctx, None, window)
+    assert dlg.form.isRowVisible(dlg.far_row)  # the department's schedule has days for them
+    assert dlg.far_hint.text() == "للساكنين بعيداً — الأحد: لا تأخير ولا غياب حتى 10:00 • الخميس: الخروج 14:00"
+    dlg.name.setText("بعيد السكن")
+    dlg.far.setChecked(True)
+    monkeypatch.setattr(employees, "confirm", lambda *a, **k: False)
+    dlg.save()
+    assert db.employees.get(dlg.employee_id)["far"] == 1
+    again = employees.EmployeeDialog(window.ctx, dlg.employee_id, window)
+    assert again.far.isChecked()
+    weekly = db.scalar("SELECT id FROM emp_groups WHERE name = 'حرس النوبات الأسبوعية'")
+    again.group.setCurrentIndex(again.group.findData(weekly))
+    assert not again.form.isRowVisible(again.far_row)  # nothing different for guards
+    page = window.admin.page("employees")
+    page.refresh()
+    row = next(r for r in page.table.model_.rows if r["full_name"] == "بعيد السكن")
+    assert row["home"] == "بعيد"

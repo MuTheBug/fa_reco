@@ -95,6 +95,8 @@ class DayRule:
     workday: bool
     start: time | None = None
     end: time | None = None
+    grace: int | None = None  # this day's own on-time limit, minutes after the start (None: the schedule's)
+    absent: int | None = None  # this day's own absence time, minutes after the start (None: the schedule's)
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,8 @@ class Shift:
     date: date
     start: datetime
     end: datetime
+    grace: int | None = None  # as in DayRule
+    absent: int | None = None
 
     @property
     def minutes(self) -> int:
@@ -127,6 +131,7 @@ class Schedule:
     missing_absent: bool = False  # a missing check-in or check-out makes the day an absence
     continuous: bool = False  # consecutive duty days are one duty: punch on joining and at the end
     exit_window: int = 0  # minutes before the exit time from which a punch is an exit (0 = any time)
+    far_days: tuple[DayRule, ...] = ()  # the days of employees who live far away (empty: as everyone's)
     personal_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     def rule_for(self, d: date) -> DayRule | None:
@@ -145,18 +150,29 @@ class Schedule:
         end = datetime.combine(d, rule.end)
         if end <= start:
             end += timedelta(days=1)
-        return Shift(d, start, end)
+        return Shift(d, start, end, rule.grace, rule.absent)
+
+    def grace_on(self, shift: Shift) -> int:
+        """Minutes after the start until which an arrival is on time, on this shift's day."""
+        return self.grace_late if shift.grace is None else shift.grace
+
+    def absent_on(self, shift: Shift) -> int:
+        """Minutes after the start after which an arrival is an absence (0 = never)."""
+        return self.absent_after if shift.absent is None else shift.absent
 
     def personal(self, anchor: date | None = None, start: time | None = None,
-                 end: time | None = None) -> Schedule:
-        """The schedule as one employee works it: own first duty day, own start and exit times."""
-        key = (anchor if self.kind == "cycle" and anchor != self.cycle_anchor else None, start, end)
-        if key == (None, None, None):
+                 end: time | None = None, far: bool = False) -> Schedule:
+        """The schedule as one employee works it: own first duty day, the days of those who live
+        far away, own start and exit times."""
+        far = bool(far and self.far_days)
+        key = (anchor if self.kind == "cycle" and anchor != self.cycle_anchor else None, start, end, far)
+        if key == (None, None, None, False):
             return self
         if key not in self.personal_cache:
-            days = self.days
+            days = self.far_days if far else self.days
             if start or end:
-                days = tuple(DayRule(True, start or r.start, end or r.end) if r.workday else r for r in days)
+                days = tuple(replace(r, start=start or r.start, end=end or r.end) if r.workday else r
+                             for r in days)
             self.personal_cache[key] = replace(self, days=days, cycle_anchor=key[0] or self.cycle_anchor,
                                                personal_cache={})
         return self.personal_cache[key]
@@ -299,6 +315,7 @@ class EmployeeData:
     cycle_start: date | None = None  # own first duty day on a rotation schedule
     own_start: time | None = None  # own start time on working days
     own_end: time | None = None  # own exit time on working days
+    far: bool = False  # lives far away: the schedule's days for those (e.g. a later Sunday, an earlier Thursday)
 
     def active_on(self, d: date) -> bool:
         if self.hire_date and d < self.hire_date:
@@ -329,7 +346,7 @@ class OrgData:
         if best is None and group_id is not None:
             best = _latest(a for a in self.group_assignments.get(group_id, ()) if a.covers(d))
         schedule = self.schedules.get(best.schedule_id) if best else None
-        return schedule.personal(emp.cycle_start, emp.own_start, emp.own_end) if schedule else None
+        return schedule.personal(emp.cycle_start, emp.own_start, emp.own_end, emp.far) if schedule else None
 
 
 def _latest(items):
@@ -567,10 +584,10 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
         if len(exits) < len(punches) - 1:
             rec.flags.add("early_punch")
         if exits:
-            out = _chosen_exit(exits, _on_time_exit(schedule, shift, hourly))
-            if out is not exits[-1]:
+            # One exit a day: the first one counts, later punches are someone passing the camera.
+            if len(exits) > 1:
                 rec.flags.add("extra_punch")
-            rec.check_out = out.ts
+            rec.check_out = exits[0].ts
             rec.worked = minutes_between(rec.check_in, rec.check_out)
     elif len(punches) >= 2:
         rec.check_in, rec.check_out = punches[0].ts, punches[-1].ts
@@ -639,18 +656,19 @@ def _compute_day(emp: EmployeeData, org: OrgData, d: date, group_id, schedule,
 
     # An hourly leave at the start of the day moves the start (and the absence cutoff) with it.
     eff_start = shift.start
-    grace = timedelta(minutes=schedule.grace_late)
+    grace = timedelta(minutes=schedule.grace_on(shift))
     for s, e, _ in hourly:
         if s <= eff_start + grace and e > eff_start:
             eff_start = e
-    cutoff = eff_start + timedelta(minutes=schedule.absent_after) if schedule.absent_after else None
+    absent_after = schedule.absent_on(shift)
+    cutoff = eff_start + timedelta(minutes=absent_after) if absent_after else None
 
     if not punches:
         if today is not None and d > today:
             rec.status = FUTURE
         elif not shift_over and (cutoff is None or now <= cutoff):
             rec.status = PENDING
-            if now >= shift.start + timedelta(minutes=schedule.grace_late):
+            if now >= shift.start + grace:
                 rec.flags.add("overdue")
         else:
             rec.status = ABSENT
@@ -732,16 +750,17 @@ def _on_time_exit(schedule: Schedule, shift: Shift, hourly) -> datetime:
 
 
 def _chosen_exit(exits: list, on_time: datetime):
-    """The exit that ends the day: the first one from the on-time exit time on, since a later
-    punch is someone passing the camera again; before that, the last (an early exit can still
-    be followed by the real one)."""
+    """The exit that ends a continuous duty: the first one from its end on, since a later punch
+    is someone passing the camera again; before that, the last (a guard walking past the camera
+    during the duty does not end it)."""
     return next((p for p in exits if p.ts >= on_time), exits[-1])
 
 
 def left_at(emp: EmployeeData, org: OrgData, rec: DayRecord, ts: datetime) -> datetime | None:
-    """When the employee already left on the day (or duty) a punch at ``ts`` belongs to: an exit
-    made from the on-time exit time on, before ``ts``. A later punch would only be someone
-    passing the camera again. None if they have not left yet (or left early)."""
+    """When the employee already left on the day (or duty) a punch at ``ts`` belongs to, before
+    ``ts``: a later punch would only be someone passing the camera again. With an exit window
+    (the department's schedule) any exit is final; without one (guards), only an exit at the end
+    of the working time. None if they have not left."""
     if rec.schedule is None or rec.shift is None:
         return None
     [before] = compute_days(emp, org, rec.date, rec.date, now=ts)
@@ -751,6 +770,8 @@ def left_at(emp: EmployeeData, org: OrgData, rec: DayRecord, ts: datetime) -> da
     block = rec.schedule.block_for(rec.date)
     shift = block.shift if block is not None else rec.shift
     hourly = _hourly_intervals(emp.leaves, shift, block.first if block is not None else rec.date)
+    if block is None and _exit_from(rec.schedule, shift, hourly) is not None:
+        return out
     return out if out >= _on_time_exit(rec.schedule, shift, hourly) else None
 
 
@@ -803,12 +824,14 @@ def _compute_block(emp: EmployeeData, org: OrgData, group_id, schedule: Schedule
             check_in = p.ts
 
     # joining: rules as for a normal day, measured from the start of the duty
-    grace = timedelta(minutes=schedule.grace_late)
+    first = schedule.shift_for(block.first) or shift
+    grace = timedelta(minutes=schedule.grace_on(first))
     eff_start = shift.start
     for s, e, _ in hourly:
         if s <= eff_start + grace and e > eff_start:
             eff_start = e
-    cutoff = eff_start + timedelta(minutes=schedule.absent_after) if schedule.absent_after else None
+    absent_after = schedule.absent_on(first)
+    cutoff = eff_start + timedelta(minutes=absent_after) if absent_after else None
     late, joined_late = 0, False
     if check_in is not None:
         if cutoff is not None and check_in > cutoff:

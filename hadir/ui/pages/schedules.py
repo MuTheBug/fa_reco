@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QGridLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QPlainTextEdit, QScrollArea, QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QPlainTextEdit, QScrollArea, QTabWidget, QVBoxLayout, QWidget)
 
 from ...core.timeutil import WEEK_ORDER, WEEKDAYS_AR, digits, fmt_date, fmt_time, parse_date, parse_time
 from ...db.schema import SEED_END, SEED_RULES, SEED_START
@@ -68,6 +68,39 @@ def plus_minutes(t: time, minutes: int) -> time:
 def day_limits(start: time, grace_late: int, absent_after: int) -> tuple[time, time | None]:
     """Until when an arrival is on time, and after when it is an absence (None = never)."""
     return plus_minutes(start, grace_late), plus_minutes(start, absent_after) if absent_after else None
+
+
+def minutes_after(start: time, t: time) -> int:
+    """Minutes from ``start`` to ``t`` (``t`` on the same day or, if earlier, the next one)."""
+    a, b = start.hour * 60 + start.minute, t.hour * 60 + t.minute
+    return (b - a) % (24 * 60)
+
+
+def far_differences(s) -> str:
+    """What is different for those who live far away, day by day ("" if nothing)."""
+    if not s.far_days:
+        return ""
+    parts = []
+    for i in WEEK_ORDER:
+        near, far = s.days[i], s.far_days[i]
+        if not near.workday or near == far:
+            continue
+        bits = []
+        if far.start != near.start:
+            bits.append(f"يبدأ {fmt_time(far.start)}")
+        g = s.grace_late if far.grace is None else far.grace
+        a = s.absent_after if far.absent is None else far.absent
+        if (g, a) != ((s.grace_late if near.grace is None else near.grace),
+                      (s.absent_after if near.absent is None else near.absent)) or far.start != near.start:
+            on_time, absent = day_limits(far.start, g, a)
+            if absent == on_time:
+                bits.append(f"لا تأخير ولا غياب حتى {fmt_time(on_time)}")
+            else:
+                bits.append(f"لا تأخير حتى {fmt_time(on_time)}" + (f" وغياب بعد {fmt_time(absent)}" if absent else ""))
+        if far.end != near.end:
+            bits.append(f"الخروج {fmt_time(far.end)}")
+        parts.append(f"{WEEKDAYS_AR[i]}: {'، '.join(bits)}")
+    return " • ".join(parts)
 
 
 class SchedulesPage(Page):
@@ -138,31 +171,69 @@ class SchedulesPage(Page):
 
 
 class DayRow:
-    def __init__(self, title: str):
+    """One day of a schedule: working or not, its times, and its own on-time and absence limits
+    (by default the schedule's: changing them makes them this day's own)."""
+
+    def __init__(self, title: str, follows: "DayRow | None" = None):
         self.label = QLabel(title)
         self.work = QCheckBox("دوام")
         self.start = TimeEdit(parse_time(SEED_START))
         self.end = TimeEdit(parse_time(SEED_END))
+        self.on_time = TimeEdit(parse_time(SEED_START))
+        self.absent = TimeEdit(parse_time(SEED_START))
+        self.on_time.setToolTip("لا يُعدّ متأخراً حتى هذا الوقت")
+        self.absent.setToolTip("يُعدّ غائباً إذا حضر بعد هذا الوقت")
         self.hint = QLabel("")
         self.next_day = QLabel("")
         self.next_day.setStyleSheet("color: #b45309;")
         self.limits = (10, 0, 0)
+        self.own = {"on_time": False, "absent": False}  # this day's own limits (changed by hand)
+        self._setting = False
         self.note: str | None = None  # replaces the hint inside a continuous duty
         self.in_block = False  # part of a continuous duty of several days
+        self.follows = follows  # a far-away employee's day works when the usual day does
+        self.editable = True
         self.work.toggled.connect(self._toggle)
         self.start.timeChanged.connect(self._refresh)
         self.end.timeChanged.connect(self._refresh)
+        self.on_time.timeChanged.connect(lambda *_: self._own("on_time"))
+        self.absent.timeChanged.connect(lambda *_: self._own("absent"))
+        if follows is not None:
+            self.work.setEnabled(False)
+            follows.work.toggled.connect(self.work.setChecked)
+
+    def widgets(self):
+        return (self.label, self.work, label("من"), self.start, label("إلى"), self.end, label("لا تأخير حتى"),
+                self.on_time, label("غياب بعد"), self.absent, self.hint, self.next_day)
+
+    def _own(self, key):
+        if not self._setting:
+            self.own[key] = True
+            self._refresh()
 
     def _toggle(self, on):
-        self.start.setEnabled(on)
-        self.end.setEnabled(on)
+        live = on and self.editable
+        for w in (self.start, self.end, self.on_time):
+            w.setEnabled(live)
+        self.absent.setEnabled(live and bool(self.limits[1] or self.own["absent"]))
         self._refresh()
 
     def set_limits(self, grace_late: int, absent_after: int, exit_window: int = 0):
         self.limits = (grace_late, absent_after, exit_window)
-        self._refresh()
+        self._toggle(self.work.isChecked())
+
+    def _sync_limits(self):
+        """Limits that are not this day's own follow the start time and the schedule's rules."""
+        self._setting = True
+        on_time, absent = day_limits(self.start.value(), *self.limits[:2])
+        if not self.own["on_time"]:
+            self.on_time.set_value(on_time)
+        if not self.own["absent"]:
+            self.absent.set_value(absent or on_time)
+        self._setting = False
 
     def _refresh(self, *_):
+        self._sync_limits()
         on = self.work.isChecked()
         overnight = on and not self.in_block and self.end.value() <= self.start.value()
         self.next_day.setText("ينتهي في اليوم التالي" if overnight else "")
@@ -172,27 +243,44 @@ class DayRow:
         if self.note is not None:
             self.hint.setText(self.note)
             return
-        on_time, absent = day_limits(self.start.value(), *self.limits[:2])
-        text = f"لا تأخير حتى {fmt_time(on_time)}"
-        if absent:
-            text += f" • غياب بعد {fmt_time(absent)}"
+        text = ""
         if self.limits[2]:
-            text += f" • الخروج من {fmt_time(plus_minutes(self.end.value(), -self.limits[2]))}"
+            text = f"الخروج من {fmt_time(plus_minutes(self.end.value(), -self.limits[2]))}"
+        if self.own["on_time"] or self.own["absent"]:
+            text = (text + " • " if text else "") + "حدود خاصة بهذا اليوم"
         self.hint.setText(text)
         self.hint.setStyleSheet("color: #64748b;")
 
-    def set(self, workday: bool, st, en):
+    def set(self, workday: bool, st, en, grace: int | None = None, absent: int | None = None):
         self.work.setChecked(workday)
         if st:
             self.start.set_value(st)
         if en:
             self.end.set_value(en)
+        self._setting = True
+        self.own = {"on_time": grace is not None, "absent": absent is not None}
+        if grace is not None:
+            self.on_time.set_value(plus_minutes(self.start.value(), grace))
+        if absent is not None:
+            self.absent.set_value(plus_minutes(self.start.value(), absent))
+        self._setting = False
         self._toggle(workday)
+
+    def limits_value(self) -> tuple[int | None, int | None]:
+        """This day's own (grace, absent) minutes after the start; None where it follows the schedule."""
+        grace = absent = None
+        if self.own["on_time"]:
+            grace = minutes_after(self.start.value(), self.on_time.value())
+            grace = None if grace == self.limits[0] else grace
+        if self.own["absent"]:
+            absent = minutes_after(self.start.value(), self.absent.value())
+            absent = None if absent == self.limits[1] else absent
+        return grace, absent
 
     def value(self):
         if not self.work.isChecked():
-            return (False, None, None)
-        return (True, self.start.value(), self.end.value())
+            return (False, None, None, None, None)
+        return (True, self.start.value(), self.end.value(), *self.limits_value())
 
 
 class ScheduleDialog(QDialog):
@@ -231,14 +319,27 @@ class ScheduleDialog(QDialog):
         form.addRow("", self.cycle_box)
         lay.addLayout(form)
 
-        self.days_card = Card("أيام الدوام وأوقاته (يمكن تحديد أوقات مختلفة لأي يوم)")
-        self.days_grid = QGridLayout()
-        self.days_card.lay.addLayout(self.days_grid)
+        self.days_card = Card("أيام الدوام وأوقاته (يمكن تحديد أوقات وحدود مختلفة لأي يوم)")
+        self.day_tabs = QTabWidget()
+        near = QWidget()
+        self.days_grid = QGridLayout(near)
+        self.day_tabs.addTab(near, "لجميع الموظفين")
+        far = QWidget()
+        fl = QVBoxLayout(far)
+        self.far_enabled = QCheckBox("للموظفين الساكنين بعيداً أوقات مختلفة (يُحدَّد السكن في بيانات كل موظف)")
+        fl.addWidget(self.far_enabled)
+        self.far_grid = QGridLayout()
+        fl.addLayout(self.far_grid)
+        fl.addStretch(1)
+        self.day_tabs.addTab(far, "الساكنون بعيداً")
+        self.days_card.lay.addWidget(self.day_tabs)
+        self.far_enabled.toggled.connect(self._far_toggled)
+        self.far_rows: list[DayRow] = []
         self.continuous = QCheckBox("أيام الدوام المتتالية نوبة واحدة متصلة: بصمة عند الالتحاق وبصمة عند انتهاء"
                                     " النوبة (مثل النوبة الأسبوعية)")
         self.continuous.toggled.connect(self._limits_changed)
         self.days_card.lay.addWidget(self.continuous)
-        fill = button("نسخ وقت أول يوم دوام إلى بقية أيام الدوام", kind="ghost")
+        fill = button("نسخ أوقات أول يوم دوام إلى بقية الأيام (في الصفحة المعروضة)", kind="ghost")
         fill.clicked.connect(self._fill)
         self.days_card.lay.addWidget(fill, 0, Qt.AlignRight)
         lay.addWidget(self.days_card)
@@ -318,13 +419,15 @@ class ScheduleDialog(QDialog):
 
     def _rebuild_days(self, *_):
         old = [r.value() for r in self.rows]
-        while self.days_grid.count():
-            w = self.days_grid.takeAt(0).widget()
-            if w:
-                w.setParent(None)
-        self.rows = []
+        for grid in (self.days_grid, self.far_grid):
+            while grid.count():
+                w = grid.takeAt(0).widget()
+                if w:
+                    w.setParent(None)
+        self.rows, self.far_rows = [], []
         weekly = self.kind.currentData() == "weekly"
         self.cycle_box.setVisible(not weekly)
+        self.day_tabs.setTabVisible(1, weekly)
         if weekly:
             titles = [(i, WEEKDAYS_AR[i]) for i in WEEK_ORDER]
         else:
@@ -332,12 +435,17 @@ class ScheduleDialog(QDialog):
         for r, (idx, title) in enumerate(titles):
             row = DayRow(title)
             row.index = idx
-            for c, w in enumerate((row.label, row.work, label("الدوام من"), row.start, label("الخروج"),
-                                   row.end, row.hint, row.next_day)):
+            for c, w in enumerate(row.widgets()):
                 self.days_grid.addWidget(w, r, c)
             row.work.toggled.connect(self._limits_changed)
             row.end.timeChanged.connect(self._limits_changed)
             self.rows.append(row)
+            if weekly:
+                far = DayRow(title, follows=row)
+                far.index = idx
+                for c, w in enumerate(far.widgets()):
+                    self.far_grid.addWidget(w, r, c)
+                self.far_rows.append(far)
         for i, row in enumerate(self.rows):
             if weekly:
                 row.set(row.index not in (4, 5), parse_time(SEED_START), parse_time(SEED_END))  # Fri/Sat off
@@ -345,7 +453,19 @@ class ScheduleDialog(QDialog):
                 row.set(*old[i])
             else:
                 row.set(i == 0, time(8, 0), time(8, 0))  # a 24-hour duty then rest days
+        self._copy_to_far()
         self._limits_changed()
+        self._far_toggled(self.far_enabled.isChecked())
+
+    def _copy_to_far(self):
+        """Far-away employees' days start as everyone's."""
+        for near, far in zip(self.rows, self.far_rows):
+            far.set(*near.value())
+
+    def _far_toggled(self, on: bool):
+        for r in self.far_rows:
+            r.editable = on
+            r._toggle(r.work.isChecked())
 
     def _limits_changed(self, *_):
         notes: dict[int, str] = {}
@@ -364,12 +484,16 @@ class ScheduleDialog(QDialog):
             r.note = notes.get(i)
             r.in_block = i in in_block
             r.set_limits(self.grace_late.value(), self.absent_after.value(), self.exit_window.value())
+        for r in self.far_rows:
+            r.set_limits(self.grace_late.value(), self.absent_after.value(), self.exit_window.value())
+        self._far_toggled(self.far_enabled.isChecked())
 
     def _fill(self):
-        first = next((r for r in self.rows if r.work.isChecked()), None)
+        rows = self.far_rows if self.day_tabs.currentIndex() == 1 else self.rows
+        first = next((r for r in rows if r.work.isChecked()), None)
         if first is None:
             return
-        for r in self.rows:
+        for r in rows:
             if r.work.isChecked():
                 r.start.set_value(first.start.value())
                 r.end.set_value(first.end.value())
@@ -399,7 +523,17 @@ class ScheduleDialog(QDialog):
         for r in self.rows:
             d = by_index.get(r.index)
             if d:
-                r.set(bool(d["workday"]), parse_time(d["start_time"]), parse_time(d["end_time"]))
+                r.set(bool(d["workday"]), parse_time(d["start_time"]), parse_time(d["end_time"]),
+                      d["grace_late"], d["absent_after"])
+        self._copy_to_far()
+        if row["far"]:
+            for r in self.far_rows:
+                d = by_index.get(r.index)
+                if d and d["workday"]:
+                    r.set(True, parse_time(d["far_start"] or d["start_time"]), parse_time(d["far_end"] or d["end_time"]),
+                          d["grace_late"] if d["far_grace"] is None else d["far_grace"],
+                          d["absent_after"] if d["far_absent"] is None else d["far_absent"])
+        self.far_enabled.setChecked(bool(row["far"]))
         self.continuous.setChecked(bool(row["continuous"]))
         self.grace_late.setValue(row["grace_late"])
         self.late_after.setChecked(bool(row["late_after_grace"]))
@@ -423,12 +557,17 @@ class ScheduleDialog(QDialog):
 
     def _data(self) -> dict:
         weekly = self.kind.currentData() == "weekly"
+        far_days = None
         if weekly:
             by = {r.index: r.value() for r in self.rows}
             days = [by[i] for i in range(7)]
+            if self.far_enabled.isChecked():
+                far = {r.index: r.value()[1:] for r in self.far_rows}
+                far_days = [far[i] for i in range(7)]
         else:
             days = [r.value() for r in self.rows]
         return dict(name=self.name.text(), kind=self.kind.currentData(), days=days,
+                    far=far_days is not None, far_days=far_days,
                     cycle_anchor=None if weekly else self.anchor.value(),
                     grace_late=self.grace_late.value(), late_after_grace=self.late_after.isChecked(),
                     absent_after=self.absent_after.value(), early_absent=self.early_mode.currentData(),
@@ -485,10 +624,14 @@ class RulesOverview(Card):
         self.db = db
         top = QHBoxLayout()
         self.pick = QComboBox()
+        self.who = QComboBox()
+        self.who.addItem("الساكنون قريباً", False)
+        self.who.addItem("الساكنون بعيداً", True)
         edit = button("تعديل الأوقات والقواعد…", "edit", "primary")
         edit.clicked.connect(self._edit)
         top.addWidget(label("الجدول:"))
         top.addWidget(self.pick, 1)
+        top.addWidget(self.who)
         top.addWidget(edit)
         self.lay.addLayout(top)
         self.table = DataTable([("day", "اليوم", "text"), ("start", "بداية الدوام", "text"),
@@ -500,10 +643,11 @@ class RulesOverview(Card):
         self.lay.addWidget(self.table)
         self.rules = label("", wrap=True)
         self.lay.addWidget(self.rules)
-        self.lay.addWidget(label("لأوقات مختلفة ليوم معيّن (مثل الخميس) غيّر وقت ذلك اليوم في نافذة التعديل."
-                                 " ولمجموعة موظفين بدوام مختلف أنشئ جدولاً من صفحة «جداول الدوام».",
-                                 "Hint", wrap=True))
+        self.lay.addWidget(label("لأوقات أو حدود مختلفة ليوم معيّن (مثل الخميس أو الأحد) غيّرها لذلك اليوم في نافذة"
+                                 " التعديل، وللساكنين بعيداً صفحة خاصة فيها. ولمجموعة موظفين بدوام مختلف أنشئ"
+                                 " جدولاً من صفحة «جداول الدوام».", "Hint", wrap=True))
         self.pick.currentIndexChanged.connect(self._show)
+        self.who.currentIndexChanged.connect(self._show)
 
     def reload(self):
         """List the schedules in use from today on, the default group's first."""
@@ -543,6 +687,8 @@ class RulesOverview(Card):
             titles = [(i, WEEKDAYS_AR[i]) for i in WEEK_ORDER]
         else:
             titles = [(i, f"اليوم {digits(i + 1)}") for i in range(len(s.days))]
+        self.who.setVisible(bool(s.far_days))
+        days = s.far_days if s.far_days and self.who.currentData() else s.days
         last = fmt_time(s.exit_until) if s.exit_until else "—"
         order = [i for i, _ in titles]
         inside: dict[int, str] = {}  # continuous duty: the days after joining
@@ -552,11 +698,12 @@ class RulesOverview(Card):
                 inside.update({order[a]: "first", order[b]: "last" if a != b else "first"})
         rows = []
         for i, title in titles:
-            r = s.days[i] if i < len(s.days) else None
+            r = days[i] if i < len(days) else None
             if r is None or not r.workday:
                 rows.append({"day": title, "start": "استراحة" if s.kind == "cycle" else "عطلة", "_tone": "muted"})
                 continue
-            on_time, absent = day_limits(r.start, s.grace_late, s.absent_after)
+            on_time, absent = day_limits(r.start, s.grace_late if r.grace is None else r.grace,
+                                         s.absent_after if r.absent is None else r.absent)
             exit_from = fmt_time(plus_minutes(r.end, -s.exit_window)) if s.exit_window else "—"
             row = {"day": title, "start": fmt_time(r.start), "on_time": fmt_time(on_time),
                    "absent": fmt_time(absent) if absent else "—", "exit_from": exit_from,
@@ -578,6 +725,8 @@ class RulesOverview(Card):
             text += f" الخروج قبل وقته: {early} •"
         text += f" عدم تسجيل الحضور أو الانصراف: {missing}"
         text += " • يمكن تحديد أوقات خاصة لأي موظف من بياناته"
+        if s.far_days:
+            text += " • للساكنين بعيداً أيام بأوقات خاصة (اختر «الساكنون بعيداً» أعلاه لعرضها)"
         if s.continuous:
             text += " • نوبة متصلة: بصمة عند الالتحاق وبصمة عند انتهاء النوبة"
         if s.kind == "cycle" and s.cycle_anchor:
