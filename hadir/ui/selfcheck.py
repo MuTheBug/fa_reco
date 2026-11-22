@@ -62,6 +62,9 @@ class IdleFaceWorker(QObject):
     def reload_galleries(self):
         pass
 
+    def refresh_templates(self):
+        pass
+
     def pause(self, timeout=0):
         return self.mode
 

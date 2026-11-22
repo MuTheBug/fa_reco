@@ -181,6 +181,38 @@ def test_kiosk_sends_the_fraud_alert_after_a_moment(window, qapp, monkeypatch):
     assert m["kind"] == "alert" and m["photo"][:2] == b"\xff\xd8" and isinstance(datetime.now(), datetime)
 
 
+def test_employees_move_to_another_computer_from_the_employees_page(window, qapp, monkeypatch, tmp_path):
+    from hadir.ui.pages import employees as P
+
+    db = window.ctx.db
+    window.admin.show_page("employees")
+    page = window.admin.pages["employees"]
+    shown = []
+    monkeypatch.setattr(P, "info", lambda parent, text, title="": shown.append((title, text)))
+    monkeypatch.setattr(P, "error", lambda parent, text, title="": shown.append(("error", text)))
+    target = tmp_path / "move"
+    monkeypatch.setattr(P.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+    monkeypatch.setattr(P.QFileDialog, "getOpenFileName", lambda *a, **k: (str(target) + ".hadir", ""))
+    refreshed = []
+    monkeypatch.setattr(window.ctx.worker, "refresh_templates", lambda: refreshed.append(1), raising=False)
+
+    dlg = P.TransferDialog(window.ctx, page)
+    dlg.export()
+    n = db.scalar("SELECT COUNT(*) FROM employees")
+    assert shown[-1][0] == "تم التصدير" and (target.parent / "move.hadir").exists()
+    previews = []
+
+    def accept(self):
+        previews.append(self)
+        return P.QDialog.Accepted
+
+    monkeypatch.setattr(P.ImportPreviewDialog, "exec", accept)
+    dlg.import_file()  # the same people are already here: only missing face samples would be added
+    title, text = shown[-1]
+    assert title == "نتيجة الاستيراد" and "أُضيف ٠ موظفاً" in text.replace("0", "٠") and dlg.imported
+    assert previews and refreshed == [1] and db.scalar("SELECT COUNT(*) FROM employees") == n
+
+
 def test_time_fields_are_not_mirrored(qapp):
     from datetime import time
 

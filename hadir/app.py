@@ -269,6 +269,37 @@ def selftest(args) -> int:
         except Exception:
             out.append(traceback.format_exc())
             code = 4
+        # the employees and their face prints moved to another computer (Windows -> Linux)
+        try:
+            from .db import transfer
+            from .db.seed import seed_defaults
+            from .db.store import Database
+            from .face.enroll import chip_png
+
+            if args.selftest_image:
+                first = db.scalar("SELECT id FROM employees ORDER BY id LIMIT 1")
+                db.faces.add_sample(first, chip_png(a.chip), 0.9, "front", "enroll", emb)
+            moved = transfer.export_transfer(db, Path(tmp) / "move")
+            other = Database(Path(tmp) / "other.db")
+            seed_defaults(other)
+            res = transfer.import_transfer(other, transfer.read_package(moved.path))
+            again = transfer.import_transfer(other, transfer.read_package(moved.path))
+            line = (f"transfer: {moved.employees} employees with {moved.samples} face samples exported and"
+                    f" imported ({res.added} added, {res.samples} samples; again: {again.added} added,"
+                    f" {again.samples} samples)")
+            if args.selftest_image:
+                pid = engine.primary.id
+                _, _, mat = other.faces.gallery(pid, engine.primary.dim)
+                line += f"; the imported face matches {float((mat @ emb[pid]).max()):.3f}"
+                if not len(mat) or float((mat @ emb[pid]).max()) < 0.99:
+                    code = 6
+            out.append(line)
+            if (res.added, res.samples, again.added, again.samples) != (moved.employees, moved.samples, 0, 0):
+                code = 6
+            other.close()
+        except Exception:
+            out.append(traceback.format_exc())
+            code = 6
         db.close()
     del app
     return finish(code)

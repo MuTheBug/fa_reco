@@ -40,6 +40,7 @@ class FaceWorker(QThread):
         self._pending: tuple | None = None
         self._stop = False
         self._galleries = None
+        self._refresh = False
         self.session: RecognitionSession | None = None
         self.enrollment: EnrollmentSession | None = None
         self.load_error = ""
@@ -79,6 +80,12 @@ class FaceWorker(QThread):
             self.settings.update(settings)
             self._pending = self._pending or (self._mode,)
 
+    def refresh_templates(self) -> None:
+        """After face samples arrive from elsewhere (an import): compute the templates they
+        lack for the models in use, then recognise them."""
+        with self._lock:
+            self._refresh = True
+
     def reload_galleries(self) -> None:
         """Re-read templates from the database (call after enrollment or edits)."""
         if self.engine is None:
@@ -113,8 +120,15 @@ class FaceWorker(QThread):
             with self._lock:
                 pending, self._pending = self._pending, None
                 gal, self._galleries = self._galleries, None
+                refresh, self._refresh = self._refresh, False
             if gal is not None:
                 self.engine.set_galleries(gal)
+            if refresh:
+                try:
+                    ensure_embeddings(self.db, self.engine)
+                    self.engine.set_galleries(load_galleries(self.db, self.engine))
+                except Exception:
+                    traceback.print_exc()
             if pending:
                 self._switch(pending[0])
             if self._mode == "idle":

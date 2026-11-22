@@ -9,9 +9,9 @@ import numpy as np
 from openpyxl import Workbook, load_workbook
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
-                               QPushButton, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QProgressBar, QPushButton, QTabWidget, QVBoxLayout, QWidget)
 
 from ...core.settings import SECURITY_LEVELS
 from ...core.timeutil import digits, fmt_time, parse_date, parse_time
@@ -60,6 +60,10 @@ class EmployeesPage(Page):
         punches = button("تصدير البصمات", "download")
         punches.clicked.connect(self.export_punches)
         header.add(punches)
+        move = button("نقل إلى جهاز آخر", "copy")
+        move.setToolTip("نقل الموظفين وبصمات وجوههم إلى جهاز آخر عليه حاضر (مثلاً من ويندوز إلى لينكس)")
+        move.clicked.connect(self.transfer)
+        header.add(move)
 
         card = Card()
         tools = QHBoxLayout()
@@ -205,6 +209,12 @@ class EmployeesPage(Page):
                 return
             info(self, f"صُدِّرت {digits(n)} بصمة.")
 
+    def transfer(self):
+        dlg = TransferDialog(self.ctx, self)
+        dlg.exec()
+        if dlg.imported:
+            self.refresh()
+
     # -------------------------------------------------------------- Excel
     def save_template(self):
         path, _ = QFileDialog.getSaveFileName(self, "حفظ نموذج الاستيراد", "نموذج_الموظفين.xlsx",
@@ -297,6 +307,155 @@ class EmployeesPage(Page):
 
 
 # ---------------------------------------------------------------------------
+class TransferDialog(QDialog):
+    """Move the employees and their face prints to another computer running Hadir."""
+
+    def __init__(self, ctx, parent=None):
+        super().__init__(parent)
+        self.ctx = ctx
+        self.db = ctx.db
+        self.imported = False
+        self.setWindowTitle("نقل الموظفين وبصمات وجوههم")
+        self.setMinimumWidth(600)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+        lay.addWidget(label("لنقل الموظفين وبصمات وجوههم إلى جهاز آخر عليه حاضر (مثلاً من ويندوز إلى لينكس)"
+                            " دون تسجيل وجوههم من جديد:", wrap=True))
+        for step in ("١. صدّرهم هنا إلى «ملف نقل».",
+                     "٢. انقل الملف إلى الجهاز الآخر (بذاكرة USB مثلاً).",
+                     "٣. هناك: الموظفون ← نقل إلى جهاز آخر ← «استيراد ملف نقل»."):
+            lay.addWidget(label(step))
+        lay.addWidget(label("ينقل الملف بيانات كل موظف ومجموعته وجدول دوامه وصورته ورمزه السري وعينات وجهه،"
+                            " ولا ينقل سجل الحضور. فيه بصمات وجوه الموظفين: احفظه في مكان آمن واحذفه بعد"
+                            " الاستيراد.", "Hint", wrap=True))
+        self.inactive = QCheckBox("يشمل الموظفين غير الفعّالين (من ترك الخدمة)")
+        self.inactive.setChecked(True)
+        lay.addWidget(self.inactive)
+        row = QHBoxLayout()
+        self.export_btn = button("تصدير إلى ملف نقل…", "upload", "primary")
+        self.export_btn.clicked.connect(self.export)
+        self.import_btn = button("استيراد ملف نقل…", "download")
+        self.import_btn.clicked.connect(self.import_file)
+        close = button("إغلاق")
+        close.clicked.connect(self.accept)
+        row.addWidget(self.export_btn)
+        row.addWidget(self.import_btn)
+        row.addStretch(1)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+    def export(self):
+        from ...db.transfer import SUFFIX, export_transfer
+
+        name = f"حاضر-الموظفين-{self.db.now():%Y-%m-%d}{SUFFIX}"
+        path, _ = QFileDialog.getSaveFileName(self, "حفظ ملف النقل", name, f"ملف نقل حاضر (*{SUFFIX})")
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            out = export_transfer(self.db, path, self.inactive.isChecked())
+        except OSError as exc:
+            QApplication.restoreOverrideCursor()
+            error(self, f"تعذّر حفظ الملف: {exc}")
+            return
+        QApplication.restoreOverrideCursor()
+        info(self, f"صُدِّر {digits(out.employees)} موظفاً و{digits(out.samples)} عينة وجه إلى الملف:\n{out.path}\n\n"
+                   "انقله إلى الجهاز الآخر واستورده هناك من: الموظفون ← نقل إلى جهاز آخر ← استيراد ملف نقل.\n"
+                   "احذف الملف بعد الاستيراد: فيه بصمات وجوه الموظفين.", "تم التصدير")
+
+    def import_file(self):
+        from ...db.transfer import SUFFIX, TransferError, import_transfer, plan_import, read_package
+
+        path, _ = QFileDialog.getOpenFileName(self, "اختر ملف النقل", "",
+                                              f"ملف نقل حاضر (*{SUFFIX});;كل الملفات (*)")
+        if not path:
+            return
+        try:
+            pkg = read_package(path)
+        except TransferError as exc:
+            error(self, str(exc))
+            return
+        plan = plan_import(self.db, pkg)
+        preview = ImportPreviewDialog(pkg, plan, self)
+        if preview.exec() != QDialog.Accepted:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            res = import_transfer(self.db, pkg, plan, keep_dates=preview.keep_dates.isChecked())
+        except TransferError as exc:
+            QApplication.restoreOverrideCursor()
+            error(self, str(exc))
+            return
+        QApplication.restoreOverrideCursor()
+        self.imported = True
+        self.ctx.worker.refresh_templates()  # recognised at the door from now on
+        lines = [f"أُضيف {digits(res.added)} موظفاً، وأُضيفت {digits(res.samples)} عينة وجه."]
+        if res.existing:
+            lines.append(f"{digits(res.existing)} موظفاً كانوا هنا: أُضيفت لهم عينات الوجه الناقصة فقط"
+                         f" ({digits(res.skipped_samples)} عينة كانت موجودة).")
+        if res.groups:
+            lines.append("مجموعات جديدة: " + "، ".join(res.groups))
+        if res.schedules:
+            lines.append("جداول دوام جديدة: " + "، ".join(res.schedules))
+        lines += res.messages[:15]
+        lines.append("\nاحذف ملف النقل الآن إن لم تعد تحتاج إليه: فيه بصمات وجوه الموظفين.")
+        info(self, "\n".join(lines), "نتيجة الاستيراد")
+
+
+class ImportPreviewDialog(QDialog):
+    """What importing the transfer file will do, before it happens."""
+
+    def __init__(self, pkg, plan, parent=None):
+        from ...db.transfer import ACTIONS
+
+        super().__init__(parent)
+        self.setWindowTitle("استيراد ملف نقل")
+        self.setMinimumSize(860, 560)
+        lay = QVBoxLayout(self)
+        m = pkg.manifest
+        made = str(m.get("created_at") or "")[:16]
+        lay.addWidget(label(f"من «{m.get('org') or 'جهاز آخر'}»، صُدِّر {digits(made)} ببرنامج حاضر"
+                            f" {m.get('app_version') or ''}: {digits(len(pkg.employees))} موظفاً و"
+                            f"{digits(pkg.samples)} عينة وجه.", "CardTitle", wrap=True))
+        parts = [f"يُضاف {digits(plan.count('new'))}"]
+        if plan.count("renamed"):
+            parts.append(f"ويُضاف {digits(plan.count('renamed'))} برقم وظيفي جديد (رقمه مستخدم هنا)")
+        if plan.count("existing"):
+            parts.append(f"و{digits(plan.count('existing'))} موجودون هنا: تُضاف بصمات وجوههم الناقصة فقط"
+                         " وتبقى بياناتهم كما هي")
+        text = "، ".join(parts) + "."
+        if plan.new_groups:
+            text += "\nمجموعات تُنشأ: " + "، ".join(plan.new_groups)
+        if plan.new_schedules:
+            text += "\nجداول دوام تُنشأ: " + "، ".join(plan.new_schedules)
+        lay.addWidget(label(text, wrap=True))
+        for w in plan.warnings:
+            warn = label("⚠ " + w, wrap=True)
+            warn.setStyleSheet(f"color: {C['warn']};")
+            lay.addWidget(warn)
+        table = DataTable([("name", "الاسم", "text"), ("code", "الرقم الوظيفي هنا", "text"),
+                           ("group", "المجموعة", "text"), ("faces", "عينات الوجه", "text"),
+                           ("action", "ما سيحدث", "text"), ("note", "ملاحظة", "text")], stretch="name")
+        table.set_rows([{"name": i.name, "code": i.new_code, "group": i.group, "faces": digits(i.faces),
+                         "action": ACTIONS[i.action] + ("" if i.active else " (غير فعّال)"), "note": i.note,
+                         "_tone": "muted" if not i.active else ("warn" if i.action == "renamed" else "")}
+                        for i in plan.items])
+        lay.addWidget(table, 1)
+        self.keep_dates = QCheckBox("احتفظ بتواريخ بداية احتساب الدوام كما في الجهاز الآخر")
+        lay.addWidget(self.keep_dates)
+        lay.addWidget(label("دون هذا الخيار يُحتسب دوام المستوردين على هذا الجهاز من اليوم، فلا تظهر أيامهم"
+                            " السابقة غياباً هنا (حضورهم فيها مسجّل على الجهاز الآخر).", "Hint", wrap=True))
+        row = QHBoxLayout()
+        ok = button("استيراد", "check", "primary")
+        ok.clicked.connect(self.accept)
+        cancel = button("إلغاء")
+        cancel.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+
 class PeriodDialog(QDialog):
     """From which day to which day (the current month so far by default)."""
 
